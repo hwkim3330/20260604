@@ -959,16 +959,6 @@ button.toc-sub.toc-active { color: var(--accent); }
 .bmx-pdr  { font-size: 13px; font-weight: 700; }
 .bmx-sub  { font-size: 9px; color: var(--muted); }
 
-/* TX frame badge in Capture tab */
-.dir-tx-badge {
-  display: inline-block; margin-left: 4px;
-  font-size: 9px; font-weight: 700; letter-spacing: .04em;
-  padding: 1px 4px; border-radius: 3px;
-  background: rgba(124,200,255,.15); color: #7cc8ff;
-  border: 1px solid rgba(124,200,255,.35);
-  vertical-align: middle; line-height: 1.4;
-}
-.cap-row-tx { opacity: .82; }
 
 /* ── PCP Mapper ─────────────────────────────────────────────────────────────── */
 .pcp-mapper {

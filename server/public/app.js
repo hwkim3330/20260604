@@ -1752,7 +1752,10 @@ async function refreshCaptureStatus() {
     const running = data.running || data.capturing || false;
     const total = data.totalPackets || data.captureCount || 0;
     [$('captureRunning'), $('captureRunning2')].forEach(el => { if (el) el.textContent = running ? '● capturing' : 'idle'; });
-    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = `${total} pkts`; });
+    // 서버 카운트는 TX 기록 포함이므로, 로컬 rows가 있으면 RX 기준으로 통일 (카운터 깜빡임 방지)
+    const rxTotal = state.captureRows.length
+      ? state.captureRows.filter(r => r.direction !== 'TX').length : total;
+    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = `${rxTotal} pkts`; });
 
     const list = $('captureInterfaces');
     if (!list) return;
@@ -1886,10 +1889,9 @@ async function loadCapturePackets() {
     updateCaptureIfaceFilters();
     renderCaptureRows();
     updateCaptureProtoSummary();
-    // TX 기록 숨김 상태에서 "카운터 > 보이는 행 수" 혼란 방지 — RX/TX 분리 표기
-    const txCnt = merged.filter(r => r.direction === 'TX').length;
-    const label = txCnt ? `${merged.length - txCnt} RX + ${txCnt} TX` : `${merged.length} pkts`;
-    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = label; });
+    // 카운터는 표와 동일하게 수신(RX) 프레임 수만 표시 (TX 기록은 표시 계층에서 제외)
+    const rxCnt = merged.filter(r => r.direction !== 'TX').length;
+    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = `${rxCnt} pkts`; });
     updateStatusBar();
   } catch { /* keep stable */ }
 }
@@ -1972,9 +1974,9 @@ function renderCaptureRows() {
   if (!tbody) return;
   const filter = ($('captureFilter')?.value || '').trim().toLowerCase();
   const activeIfaces = [...state.captureIfaceFilter].filter(k => !k.startsWith('__seen__'));
-  const showTx = $('captureShowTx')?.checked ?? false;  // 기본: TX 기록 숨김 (RX만)
+  // TX 기록은 표에 표시하지 않음 — 버퍼에는 유지(전송 증거·RxVerify dedup·장애 분석용)
   const rows = state.captureRows.filter(r => {
-    if (!showTx && r.direction === 'TX') return false;
+    if (r.direction === 'TX') return false;
     if (activeIfaces.length && r.interfaceName && !state.captureIfaceFilter.has(r.interfaceName)) return false;
     return rowMatchesFilter(r, filter);
   });
@@ -1982,11 +1984,10 @@ function renderCaptureRows() {
   tbody.innerHTML = rows.map((r, i) => {
     const col = _getIfaceColor(r.interfaceName);
     const style = col ? ` style="border-left:3px solid ${col.border};background:${col.bg};"` : '';
-    const txBadge = r.direction === 'TX' ? `<span class="dir-tx-badge">TX</span>` : '';
     return `
-    <tr data-idx="${i}" class="proto-${esc((r.protocol||'').toLowerCase())}${r.direction === 'TX' ? ' cap-row-tx' : ''}"${style}>
+    <tr data-idx="${i}" class="proto-${esc((r.protocol||'').toLowerCase())}"${style}>
       <td>${r.no}</td><td>${esc(r.time)}</td>
-      <td>${col ? `<span class="iface-badge" style="border-color:${col.border};color:${col.border};">${esc(r.interfaceName)}</span>${txBadge}` : esc(r.interfaceName) + txBadge}${r._node === 'B' ? `<span class="pm-badge pm-remote" style="margin-left:3px;font-size:9px;">B</span>` : ''}</td>
+      <td>${col ? `<span class="iface-badge" style="border-color:${col.border};color:${col.border};">${esc(r.interfaceName)}</span>` : esc(r.interfaceName)}${r._node === 'B' ? `<span class="pm-badge pm-remote" style="margin-left:3px;font-size:9px;">B</span>` : ''}</td>
       <td>${esc(r.srcMac)}</td><td>${esc(r.dstMac)}</td>
       <td>${esc(r.source)}</td><td>${esc(r.destination)}</td>
       <td><strong>${esc(r.protocol)}</strong></td>
@@ -5305,7 +5306,6 @@ async function init() {
   $('captureStart')?.addEventListener('click', startCapture);
   $('captureStop')?.addEventListener('click', stopCapture);
   $('captureClear')?.addEventListener('click', clearCapture);
-  $('captureShowTx')?.addEventListener('change', renderCaptureRows);
   $('captureExportCsv')?.addEventListener('click', downloadCaptureCsv);
   $('captureFilter')?.addEventListener('input', () => {
     const val = ($('captureFilter')?.value || '').trim();
