@@ -1886,8 +1886,10 @@ async function loadCapturePackets() {
     updateCaptureIfaceFilters();
     renderCaptureRows();
     updateCaptureProtoSummary();
-    const total = merged.length;
-    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = `${total} pkts`; });
+    // TX 기록 숨김 상태에서 "카운터 > 보이는 행 수" 혼란 방지 — RX/TX 분리 표기
+    const txCnt = merged.filter(r => r.direction === 'TX').length;
+    const label = txCnt ? `${merged.length - txCnt} RX + ${txCnt} TX` : `${merged.length} pkts`;
+    [$('captureTotal'), $('captureTotal2')].forEach(el => { if (el) el.textContent = label; });
     updateStatusBar();
   } catch { /* keep stable */ }
 }
@@ -3575,6 +3577,8 @@ async function executeEvent(row, iface, ctx = {}) {
       if (ctx.fireInMs) payload.fireInMs = ctx.fireInMs;
       // RxVerify 노이즈 필터용 — 이번에 보낸 프레임의 MAC 쌍 기록
       _seqSentMacs.push({ src: String(payload.srcMac || '').toLowerCase(), dst: String(payload.dstMac || '').toLowerCase() });
+      // rxverify 없이 반복 전송하는 경로(Send Selected 등)에서 무한 누적 방지
+      if (_seqSentMacs.length > 256) _seqSentMacs.splice(0, _seqSentMacs.length - 256);
       // Route to remote node if the selected interface belongs to Node B
       const ifaceEntry = effectiveIface ? state.allIfaces.find(ai => ai.name === effectiveIface) : null;
       const sendUrl = ifaceEntry?.nodeUrl
