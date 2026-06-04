@@ -24,7 +24,11 @@ function readCsvText(filePath) {
   // Try UTF-8: U+FFFD replacement character indicates invalid bytes
   const utf8 = buf.toString('utf8');
   if (!utf8.includes('�')) return utf8;
-  // Fall back to EUC-KR (CP949) via iconv-lite if available
+  // If the RAW bytes already contain EF BF BD, the file is UTF-8 whose Korean
+  // was destroyed by an earlier lossy conversion — decoding it as EUC-KR would
+  // mangle it further (� → 占쏙옙). Return it as-is; the honest � is clearer.
+  if (buf.includes(Buffer.from([0xEF, 0xBF, 0xBD]))) return utf8;
+  // Genuinely invalid UTF-8 → fall back to EUC-KR (CP949, 한국어 엑셀 기본)
   const iconv = getIconv();
   if (iconv) return iconv.decode(buf, 'euc-kr');
   return utf8; // last resort: return broken string

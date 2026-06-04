@@ -1,5 +1,5 @@
-Test_Scenario_ID,TC_ID,Index,Name,EventType,MAC,Port,,VlanValid,VlanID,FrameRef,Interface,Expected,Timeout,���
-2,0,0,FDB_Initialize,FdbInitialize,-,-,,-,-,-,,-,,Forwarding ����_Static
+Test_Scenario_ID,TC_ID,Index,Name,EventType,MAC,Port,,VlanValid,VlanID,FrameRef,Interface,Expected,Timeout,비고
+2,0,0,FDB_Initialize,FdbInitialize,-,-,,-,-,-,,-,,Forwarding 검증_Static
 2,0,1,MAC_FDB_Write,FdbWrite,A0:36:9F:A8:DA:60,0b000001,,-,-,-,,-,,
 2,0,2,MAC_FDB_Write,FdbWrite,A0:36:9F:A8:DA:61,0b000010,,-,-,-,,-,,
 2,0,3,MAC_FDB_Write,FdbWrite,A0:36:9F:A8:DA:62,0b000100,,-,-,-,,-,,
