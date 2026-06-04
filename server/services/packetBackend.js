@@ -318,6 +318,10 @@ async function sendPackets(profile) {
 
   const count      = profile.count      ?? 1;
   const intervalMs = profile.intervalMs ?? 0;
+  // 동기 발사 barrier: 요청 수신 후 fireInMs 뒤에 실제 송신.
+  // 여러 노드/인터페이스에 같은 fireInMs로 병렬 요청하면 클럭 동기화 없이도
+  // LAN RTT 편차(~1ms) 수준으로 동시에 와이어에 나간다.
+  const fireInMs   = Math.min(10000, Math.max(0, parseInt(profile.fireInMs) || 0));
 
   // Auto-fill srcMac if missing
   if (!profile.srcMac) {
@@ -337,6 +341,7 @@ async function sendPackets(profile) {
   _sendInFlight.add(dev);
   try {
     const handle = _getSendHandle(dev);
+    if (fireInMs > 0) await new Promise(r => setTimeout(r, fireInMs));
     let sent = 0, bytes = 0;
     for (let i = 0; i < count; i++) {
       const frame = buildFrame(profile, i);

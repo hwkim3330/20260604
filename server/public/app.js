@@ -3354,6 +3354,10 @@ function parseVlanValid(row) {
 }
 
 // ── Event executor ────────────────────────────────────────────────────────────
+// 시퀀스에서 마지막 RxVerify 이후 보낸 프레임들의 MAC 쌍 — RxVerify가 캡처에서
+// 테스트 프레임만 골라 세도록 (배경 ARP 등 노이즈가 비트맵을 오염시키는 것 방지)
+let _seqSentMacs = [];
+
 async function executeEvent(row, iface, ctx = {}) {
   // 'Event Type'(공백) 와 'EventType' 모두 지원
   const evType = (row['EventType'] || row['Event Type'] || '').toLowerCase().trim();
@@ -3565,6 +3569,10 @@ async function executeEvent(row, iface, ctx = {}) {
       const payload = buildPacketPayload(pkt);
       const effectiveIface = row._iface || iface;
       if (effectiveIface) payload.interface = effectiveIface;
+      // 동기 발사: 병렬 그룹이면 모든 노드가 수신 후 fireInMs 뒤 동시에 송신
+      if (ctx.fireInMs) payload.fireInMs = ctx.fireInMs;
+      // RxVerify 노이즈 필터용 — 이번에 보낸 프레임의 MAC 쌍 기록
+      _seqSentMacs.push({ src: String(payload.srcMac || '').toLowerCase(), dst: String(payload.dstMac || '').toLowerCase() });
       // Route to remote node if the selected interface belongs to Node B
       const ifaceEntry = effectiveIface ? state.allIfaces.find(ai => ai.name === effectiveIface) : null;
       const sendUrl = ifaceEntry?.nodeUrl
@@ -3643,9 +3651,21 @@ async function executeEvent(row, iface, ctx = {}) {
         for (const url of allNodeBUrls)
           fetches.push(fetch(`${url}/api/capture/packets?limit=1000`, { signal: AbortSignal.timeout(3000) }).then(r => r.json()).catch(() => ({ rows: [] })));
         const results = await Promise.all(fetches);
+        // 테스트로 보낸 프레임만 카운트 (MAC 쌍 매칭) — 배경 ARP 등 노이즈 제외.
+        // srcMac이 00:..:00이면 백엔드가 실제 NIC MAC으로 채우므로 dst만 매칭.
+        const matchMacs = _seqSentMacs.length ? _seqSentMacs : null;
+        const ZERO_MAC = '00:00:00:00:00:00';
         for (const data of results) {
           for (const pkt of (data.rows || [])) {
             if (pkt.direction === 'TX') continue;
+            if (matchMacs) {
+              const eth = pkt.decoded?.ethernet || {};
+              const src = String(eth.srcMac || '').toLowerCase();
+              const dst = String(eth.dstMac || '').toLowerCase();
+              const hit = matchMacs.some(m =>
+                m.dst === dst && (m.src === ZERO_MAC || !m.src || m.src === src));
+              if (!hit) continue;
+            }
             const entry = state.portmap.find(e => e.iface === pkt.interface);
             if (entry !== undefined) receivedPorts.add(Number(entry.port));
           }
@@ -3660,6 +3680,7 @@ async function executeEvent(row, iface, ctx = {}) {
       for (const url of allNodeBUrls)
         stopPs.push(fetch(`${url}/api/capture/stop`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
       await Promise.all(stopPs);
+      _seqSentMacs = [];  // 이번 검증 구간의 송신 기록 소진
 
       const gotBitmap   = [...receivedPorts].reduce((acc, p) => acc | (1 << p), 0);
       const rawStr = String(row['Expected'] || row['expected'] || '0');
@@ -3982,6 +4003,7 @@ async function runSeqSequence() {
 
     // Clear previous results for this TC
     for (const row of (tc.rows || [])) { row._result = ''; row._resultDetail = ''; }
+    _seqSentMacs = [];  // 이전 TC의 송신 기록 제거
     renderCsvSequence(tc.rows || []);
 
     // 이전 실행에서 삽입된 branch sub-rows 제거
@@ -4031,17 +4053,24 @@ async function runSeqSequence() {
         const capturePrestarted = nextCapturePrestarted_seq;
         nextCapturePrestarted_seq = false;
 
+        // 다중 인터페이스 볼리(volley)면 동기 발사: 모든 노드가 요청 수신 후
+        // syncFireMs 뒤 동시에 송신 → HTTP 디스패치/RTT 시차 제거 (~1ms 정밀도)
+        const syncFireMs = ifaceGroups.size > 1 ? 250 : 0;
+
         // 각 인터페이스 그룹을 병렬 실행
         const groupResults = await Promise.all(
           [...ifaceGroups.values()].map(async group => {
             const results = [];
+            let firstInGroup = true;
             for (const { idx, row: pRow } of group) {
               let res;
               try {
-                res = await executeEvent(pRow, iface, { capturePrestarted, rowIdx: idx, lastResult: lastResult_seq });
+                res = await executeEvent(pRow, iface, { capturePrestarted, rowIdx: idx, lastResult: lastResult_seq,
+                                                        fireInMs: firstInGroup ? syncFireMs : 0 });
               } catch (err) {
                 res = { ok: false, error: err.message };
               }
+              firstInGroup = false;
               results.push({ idx, res });
             }
             return results;
