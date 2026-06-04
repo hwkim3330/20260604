@@ -9,7 +9,8 @@
 *.sln.docstates
 
 # ── Node.js ───────────────────────────────────────────────────────────────────
-node_modules/
+# node_modules는 의도적으로 커밋함 — 두 노드가 동일 x86_64 Linux + Node 22(ABI 127)라
+# 네이티브 모듈(cap/serialport) 포함 pull-and-run 가능. Node 메이저 업그레이드 시 재빌드 필요.
 npm-debug.log*
 yarn-error.log
 .npm
