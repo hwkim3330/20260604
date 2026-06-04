@@ -20,6 +20,25 @@ let _services  = null;
 let _testsDir  = null;
 let _stopFlag  = false;
 
+const PORTMAP_FILE = path.join(__dirname, '../logs/portmap.json');
+const DEFAULT_PORTMAP = [
+  { port: 0, iface: 'enp12s0f0' }, { port: 1, iface: 'enp12s0f1' },
+  { port: 2, iface: 'enp12s0f2' }, { port: 3, iface: 'enp12s0f3' },
+];
+
+function _loadPortmap() {
+  try {
+    if (fs.existsSync(PORTMAP_FILE)) return JSON.parse(fs.readFileSync(PORTMAP_FILE, 'utf8'));
+  } catch {}
+  return DEFAULT_PORTMAP;
+}
+
+function _parseBin(s) {
+  const t = String(s || '0').trim();
+  if (t.startsWith('0b') || t.startsWith('0B')) return parseInt(t.slice(2), 2) || 0;
+  return parseInt(t) || 0;
+}
+
 function init(services, testsDir) {
   _services = services;
   _testsDir = testsDir;
@@ -62,11 +81,21 @@ async function runTest(testName) {
         const nextType = _getStepType(steps[i + 1]);
         if (nextType === 'rxverify') {
           const ns = steps[i + 1];
-          const nsIfaces = ns.interfaces ?? (ns.captureInterface ? [ns.captureInterface] : []);
-          _services.packetBackend.clearCapture();
-          _services.packetBackend.startCapture(nsIfaces, '', () => {}, () => {});
-          nextCapturePrestarted = true;
-          console.log(`[autoEngine] step ${i+1}: pre-started capture for following rxverify step`);
+          const portmap = _loadPortmap();
+          const bitmap  = _parseBin(ns.Expected || ns.expected || '0');
+          const nsIfaces = [];
+          for (let k = 0; k < 8; k++) {
+            if (bitmap & (1 << k)) {
+              const e = portmap.find(p => Number(p.port) === k);
+              if (e?.iface) nsIfaces.push(e.iface);
+            }
+          }
+          if (nsIfaces.length) {
+            _services.packetBackend.clearCapture();
+            _services.packetBackend.startCapture(nsIfaces, '', () => {}, () => {});
+            nextCapturePrestarted = true;
+            console.log(`[autoEngine] step ${i+1}: pre-started capture on [${nsIfaces.join(', ')}] for rxverify`);
+          }
         }
       }
 
@@ -205,15 +234,42 @@ async function runStep(step, ctx = {}) {
       const vlanValid = vlanValidRaw === '1' || vlanValidRaw === 'y' || vlanValidRaw === 'yes' || vlanValidRaw === 'true';
       if (!mac || mac === '-') return { pass: false, detail: 'No MAC' };
       const entry = await switchProtocol.fdbRead({ mac, vlanId, vlanValid });
-      return entry.found
-        ? { pass: true,  detail: `found mac=${entry.mac} port=${entry.port}` }
-        : { pass: false, detail: `MAC not found: ${mac}` };
+      const detail = entry.found
+        ? `found mac=${entry.mac} port=${entry.port} bucket=${entry.bucket}`
+        : `not found: ${mac}`;
+      return { pass: true, detail };
+    }
+
+    // ── FdbVerify ──────────────────────────────────────────────────────────────────
+    case 'fdbverify': {
+      const mac    = step.MAC || step.mac || '';
+      const vlanId = parseInt(step.VlanID || step.VlanId || step.vlanid || '0') || 0;
+      const vlanValidRaw = String(step.VlanValid || step.vlanValid || step.vlanvalid || '').toLowerCase().trim();
+      const vlanValid = ['1','y','yes','true'].includes(vlanValidRaw);
+      const portRaw        = String(step.ExpectedPort || step.expectedPort || '0').trim();
+      const expectedPort   = (portRaw.startsWith('0b') || portRaw.startsWith('0B'))
+        ? parseInt(portRaw.slice(2), 2) || 0
+        : parseInt(portRaw) || 0;
+      const rawAbsent      = String(step.ExpectedAbsent || step.expectedAbsent || '').toLowerCase().trim();
+      const expectedAbsent = ['1','y','yes','true'].includes(rawAbsent);
+      if (!mac || mac === '-') return { pass: false, detail: 'No MAC' };
+      const entry = await switchProtocol.fdbRead({ mac, vlanId, vlanValid });
+      if (expectedAbsent) {
+        return entry.found
+          ? { pass: false, detail: `Expected absent but MAC found (port=${entry.port})` }
+          : { pass: true,  detail: `absent confirmed` };
+      }
+      if (!entry.found) return { pass: false, detail: `MAC not found: ${mac}` };
+      const portMatch = (entry.port & 0x1FF) === (expectedPort & 0x1FF);
+      return portMatch
+        ? { pass: true,  detail: `port=${entry.port} (expected ${expectedPort})` }
+        : { pass: false, detail: `Port mismatch: got ${entry.port}, expected ${expectedPort}` };
     }
 
     // ── FdbReadBucket (Bucket, Slot, Expected=MAC) ──────────────────────────────
     case 'fdbreadbucket': {
       const bucket   = parseInt(step.Bucket || step.bucket || '0') || 0;
-      const slotMask = parseHex(step.Slot || step.slot || '0');
+      const slotMask = parseHex(step.Slot || step.slot || '0x1') || 1;
       const expected = (step.Expected || step.expected || '').trim();
       try {
         const entry = await switchProtocol.fdbReadBucket({ bucket, slot: slotMask });
@@ -242,44 +298,52 @@ async function runStep(step, ctx = {}) {
       }
     }
 
-    // ── RxVerify — start capture, poll until expected frames arrive, stop ──────
+    // ── RxVerify — 포트 비트맵 기반 수신 검증 ─────────────────────────────────
     case 'rxverify': {
-      const ifaces    = step.interfaces ?? (step.captureInterface ? [step.captureInterface] : []);
-      const expected  = parseInt(step.captureExpected ?? 1) || 1;
-      const rawTo     = step.timeoutMs ?? step.Timeout ?? step.timeout ?? 3000;
-      const timeoutMs = (typeof rawTo === 'string' ? parseInt(rawTo) : rawTo) || 3000;
+      const expectedBitmap = _parseBin(step.Expected || step.expected || '0');
+      const rawTo     = step.Timeout ?? step.timeout ?? step.timeoutMs ?? '1000ms';
+      const timeoutMs = (typeof rawTo === 'string' ? parseInt(rawTo) : rawTo) || 1000;
 
-      // Build filter: prefer Expected (dst MAC from CSV), fall back to captureFilter
-      const rawFilter = (step.Expected || step.expected || step.captureFilter || '').trim();
-      // Normalise MAC xx:xx:xx:xx:xx:xx → 12 hex chars for substring search in frameHex
-      const macFilter = /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(rawFilter)
-        ? rawFilter.replace(/:/g, '').toLowerCase()
-        : rawFilter.toLowerCase();
+      const portmap = _loadPortmap();
+      const expectedPorts = [];
+      for (let i = 0; i < 8; i++) { if (expectedBitmap & (1 << i)) expectedPorts.push(i); }
 
-      // If capture was pre-started before packet send (look-ahead), keep using
-      // that buffer so the sent frame is already captured.
+      // expected=0b000000이면 모든 로컬 포트 캡처 후 "수신 없음" 검증
+      const ifaces = expectedPorts.length
+        ? expectedPorts.map(p => portmap.find(e => Number(e.port) === p)?.iface).filter(Boolean)
+        : portmap.filter(e => !e.nodeUrl).map(e => e.iface).filter(Boolean);
+      if (!ifaces.length) {
+        return { pass: false, detail: `RxVerify: portmap에 0b${expectedBitmap.toString(2)} 해당 포트 없음` };
+      }
+
       if (!ctx.capturePrestarted) {
         packetBackend.clearCapture();
         packetBackend.startCapture(ifaces, '', () => {}, () => {});
       }
 
       const deadline = Date.now() + timeoutMs;
-      let matched = 0;
+      const receivedPorts = new Set();
       while (Date.now() < deadline) {
         await delay(200);
         const { rows } = packetBackend.getCaptures(10000, 0);
-        const hits = macFilter
-          ? rows.filter(r => (r.frameHex || '').toLowerCase().includes(macFilter)
-              || JSON.stringify(r.decoded || {}).toLowerCase().includes(macFilter))
-          : rows;
-        matched = hits.length;
-        if (matched >= expected) break;
+        for (const pkt of rows) {
+          if (pkt.direction === 'TX') continue;
+          const entry = portmap.find(e => e.iface === pkt.interface);
+          if (entry !== undefined) receivedPorts.add(Number(entry.port));
+        }
+        if (expectedPorts.every(p => receivedPorts.has(p))) break;
       }
       packetBackend.stopCapture();
 
-      return matched >= expected
-        ? { pass: true,  detail: `${matched}/${expected} frames captured` }
-        : { pass: false, detail: `RxVerify: only ${matched}/${expected} frames in ${timeoutMs}ms` };
+      const gotBitmap   = [...receivedPorts].reduce((acc, p) => acc | (1 << p), 0);
+      const rawStr  = String(step.Expected || step.expected || '0');
+      const origLen = rawStr.startsWith('0b') || rawStr.startsWith('0B')
+        ? rawStr.length - 2 : Math.max(expectedBitmap.toString(2).length, gotBitmap.toString(2).length);
+      const padLen  = Math.max(origLen, gotBitmap.toString(2).length);
+      const allReceived = gotBitmap === expectedBitmap;
+      return allReceived
+        ? { pass: true,  detail: `received 0b${gotBitmap.toString(2).padStart(padLen, '0')}` }
+        : { pass: false, detail: `expected 0b${expectedBitmap.toString(2).padStart(padLen,'0')}, got 0b${gotBitmap.toString(2).padStart(padLen,'0')} in ${timeoutMs}ms` };
     }
 
     case 'capture':

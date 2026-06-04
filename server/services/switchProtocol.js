@@ -75,20 +75,21 @@ async function registerWrite(payload) {
 
 // ── FDB register offsets ───────────────────────────────────────────────────────
 const FDB = {
-  OFF_MCU_MAC0:   0xA18,
-  OFF_MCU_MAC1:   0xA1C,
-  OFF_MCU_VLAN:   0xA20,
-  OFF_MCU_PORT:   0xA24,
-  OFF_MCU_BUCKET: 0xA28,
-  OFF_MCU_CMD:    0xA2C,
-  OFF_FDB_STATUS: 0xA40,
-  OFF_CMD_STATUS: 0xA44,
-  OFF_RD_BUCKET:  0xA48,
-  OFF_RD_PORT:    0xA4C,
-  OFF_RD_FLAGS:   0xA50,
-  OFF_RD_MAC0:    0xA54,
-  OFF_RD_MAC1:    0xA58,
-  OFF_RD_MAC2:    0xA5C,
+  OFF_MCU_MAC0:      0xA18,
+  OFF_MCU_MAC1:      0xA1C,
+  OFF_MCU_VLAN:      0xA20,
+  OFF_MCU_PORT:      0xA24,
+  OFF_MCU_BUCKET:    0xA28,
+  OFF_MCU_CMD:       0xA2C,
+  OFF_FDB_STATUS:    0xA40,
+  OFF_CMD_STATUS:    0xA44,
+  OFF_RD_BUCKET:     0xA48,
+  OFF_RD_PORT:       0xA4C,
+  OFF_RD_FLAGS:      0xA50,
+  OFF_RD_MAC0:       0xA54,
+  OFF_RD_MAC1:       0xA58,
+  OFF_RD_MAC2:       0xA5C,
+  OFF_RD_FLOOD_MASK: 0xA60,
 };
 
 const CMD = {
@@ -98,6 +99,9 @@ const CMD = {
   WRITE_BUCKET: 0x15,
   HASH_DELETE:  0x16,
   FLUSH_ALL:    0x70,
+  FLOOD_INIT:   0x20,
+  FLOOD_READ:   0x22,
+  FLOOD_WRITE:  0x24,
 };
 
 function parseMac(mac) {
@@ -113,18 +117,21 @@ function macToWords(mac) {
   return { lo, hi };
 }
 
-function wordsToMac(lo, hi) {
-  // lo = RD_MAC0|(RD_MAC1<<16): b[5]|b[4]<<8|b[3]<<16|b[2]<<24
-  // hi = RD_MAC2&0xFFFF:        b[0]<<8|b[1]
+function wordsToMac(mac0, mac1, mac2) {
+  // FDB spec: each register [31:16]=Sequence Number, [15:0]=MAC portion
+  // RD_MAC0[15:0] = MAC[15:0],  RD_MAC1[15:0] = MAC[31:16],  RD_MAC2[15:0] = MAC[47:32]
+  const lo16  = mac0 & 0xFFFF;   // MAC[15:0]
+  const mid16 = mac1 & 0xFFFF;   // MAC[31:16]
+  const hi16  = mac2 & 0xFFFF;   // MAC[47:32]
   const b = [
-    (hi >> 8) & 0xFF,
-    hi & 0xFF,
-    (lo >> 24) & 0xFF,
-    (lo >> 16) & 0xFF,
-    (lo >> 8) & 0xFF,
-    lo & 0xFF,
+    (hi16 >> 8)  & 0xFF,  // MAC[47:40]
+    hi16         & 0xFF,  // MAC[39:32]
+    (mid16 >> 8) & 0xFF,  // MAC[31:24]
+    mid16        & 0xFF,  // MAC[23:16]
+    (lo16 >> 8)  & 0xFF,  // MAC[15:8]
+    lo16         & 0xFF,  // MAC[7:0]
   ];
-  return b.map(x => x.toString(16).padStart(2, '0')).join(':');
+  return b.map(x => x.toString(16).padStart(2, '0').toUpperCase()).join(':');
 }
 
 async function pollStatus(sid, mask, timeoutMs = 500) {
@@ -163,7 +170,7 @@ async function fdbRead(payload) {
   const mac0   = await readRegister(sid, FDB.OFF_RD_MAC0);
   const mac1   = await readRegister(sid, FDB.OFF_RD_MAC1);
   const mac2   = await readRegister(sid, FDB.OFF_RD_MAC2);
-  const rdMac  = wordsToMac((mac0 | (mac1 << 16)) >>> 0, mac2 & 0xFFFF);
+  const rdMac  = wordsToMac(mac0, mac1, mac2);
 
   return {
     found:  !!(flags & 0x8000),
@@ -226,7 +233,7 @@ async function fdbReadBucket(payload) {
   const bucket = payload.bucket ?? 0;
   const slot   = payload.slot   ?? 0;   // 슬롯 비트마스크 (0x1, 0x2, 0x4, 0x8)
 
-  await writeRegister(sid, FDB.OFF_MCU_BUCKET, bucket & 0x3FF);
+  await writeRegister(sid, FDB.OFF_MCU_BUCKET, ((slot & 0xF) << 16) | (bucket & 0x3FF));
   await writeRegister(sid, FDB.OFF_MCU_CMD, CMD.READ_BUCKET);
 
   const st = await pollStatus(sid, 0x1, 500); // STATUS_RD_MAC
@@ -235,7 +242,7 @@ async function fdbReadBucket(payload) {
   const mac0  = await readRegister(sid, FDB.OFF_RD_MAC0);
   const mac1  = await readRegister(sid, FDB.OFF_RD_MAC1);
   const mac2  = await readRegister(sid, FDB.OFF_RD_MAC2);
-  const rdMac = wordsToMac((mac0 | (mac1 << 16)) >>> 0, mac2 & 0xFFFF);
+  const rdMac = wordsToMac(mac0, mac1, mac2);
 
   return {
     found:  !!(flags & 0x8000),
@@ -267,9 +274,44 @@ async function fdbWriteBucket(payload) {
   return { ok: true, bucket: bucket & 0x3FF, slot: slot & 0xF };
 }
 
+// ── Flood Mask Table API ──────────────────────────────────────────────────────
+
+async function fdbFloodRead(payload) {
+  const sid    = serialBridge.getSession(payload.session);
+  const vlanId = payload.vlanId ?? 0;
+
+  await writeRegister(sid, FDB.OFF_MCU_VLAN, vlanId & 0xFFF);
+  await writeRegister(sid, FDB.OFF_MCU_CMD, CMD.FLOOD_READ);
+  await pollStatus(sid, 0x2, 500);  // CMD_STATUS bit[1] = RD-Flood-Mask Result Valid
+
+  const raw  = await readRegister(sid, FDB.OFF_RD_FLOOD_MASK);
+  const mask = raw & 0x1FF;  // [8:0] = 9-bit port bitmap
+  return { vlanId, mask };
+}
+
+async function fdbFloodWrite(payload) {
+  const sid    = serialBridge.getSession(payload.session);
+  const vlanId = payload.vlanId ?? 0;
+  const mask   = payload.mask   ?? 0;
+
+  await writeRegister(sid, FDB.OFF_MCU_VLAN, vlanId & 0xFFF);
+  await writeRegister(sid, FDB.OFF_MCU_PORT, mask & 0x1FF);
+  await writeRegister(sid, FDB.OFF_MCU_CMD, CMD.FLOOD_WRITE);
+  await pollStatus(sid, 0x2, 500);  // CMD_STATUS bit[1] = Flood-Mask access done (read/write 공용)
+  return { ok: true, vlanId, mask };
+}
+
+async function fdbFloodInit(payload) {
+  const sid = serialBridge.getSession(payload.session);
+  await writeRegister(sid, FDB.OFF_MCU_CMD, CMD.FLOOD_INIT);
+  await pollStatus(sid, 0x2, 500);  // CMD_STATUS bit[1] = Flood-Mask access done
+  return { ok: true };
+}
+
 module.exports = {
   registerStatus, registerRead, registerWrite,
   fdbRead, fdbWrite, fdbWriteBucket, fdbDelete, fdbFlush, fdbReadBucket,
+  fdbFloodRead, fdbFloodWrite, fdbFloodInit,
   readRegister, writeRegister,
   setBaseAddress(addr) { BASE_ADDRESS = parseHex(addr); },
 };

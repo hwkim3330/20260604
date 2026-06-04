@@ -1,0 +1,4 @@
+Test_Scenario_ID,TC_ID,Index,Name,EventType,Address,Value,Mask,VlanValid,VlanID,FrameRef,Interface,Expected,Timeout
+4,1,0,Rx_Result,RxVerify,-,-,-,-,-,-,-,0b000000,1000ms
+4,1,1,BranchTo,BranchTo,-,-,-,-,-,-,-,-,-
+4,1,2,Delay,Delay,,,,,,,,,1000ms

@@ -52,4 +52,28 @@ router.post('/fdb/read-bucket', async (req, res) => {
   } catch (e) { wErr(res, e); }
 });
 
+// POST /api/fdb/flood-read   body: { vlanId }
+router.post('/fdb/flood-read', async (req, res) => {
+  try {
+    const r = await req.app.locals.switchProtocol.fdbFloodRead(req.body || {});
+    res.json({ ok: true, ...r });
+  } catch (e) { wErr(res, e); }
+});
+
+// POST /api/fdb/flood-write  body: { vlanId, mask }
+router.post('/fdb/flood-write', async (req, res) => {
+  try {
+    const r = await req.app.locals.switchProtocol.fdbFloodWrite(req.body || {});
+    res.json({ ok: true, ...r });
+  } catch (e) { wErr(res, e); }
+});
+
+// POST /api/fdb/flood-init
+router.post('/fdb/flood-init', async (req, res) => {
+  try {
+    const r = await req.app.locals.switchProtocol.fdbFloodInit(req.body || {});
+    res.json({ ok: true, ...r });
+  } catch (e) { wErr(res, e); }
+});
+
 module.exports = router;

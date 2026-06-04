@@ -1,17 +1,15 @@
 'use strict';
 
 function sendProxyError(res, err) {
-  res.status(err.statusCode || 503).json({
-    ok: false,
-    error: err.message,
-    source: 'csharp-local-api'
-  });
+  const status = err.workerError ? 502 : 503;
+  res.status(status).json({ ok: false, error: err.message });
 }
 
 function proxyGet(router, publicPath, csharpPath, csharp) {
-  router.get(publicPath, async (_req, res) => {
+  router.get(publicPath, async (req, res) => {
     try {
-      res.json(await csharp.get(csharpPath));
+      const data = await csharp.get(csharpPath, req.query);
+      res.json(data);
     } catch (err) {
       sendProxyError(res, err);
     }
@@ -21,7 +19,8 @@ function proxyGet(router, publicPath, csharpPath, csharp) {
 function proxyPost(router, publicPath, csharpPath, csharp) {
   router.post(publicPath, async (req, res) => {
     try {
-      res.json(await csharp.post(csharpPath, req.body || {}));
+      const data = await csharp.post(csharpPath, req.body);
+      res.json(data);
     } catch (err) {
       sendProxyError(res, err);
     }

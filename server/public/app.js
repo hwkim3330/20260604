@@ -67,6 +67,16 @@ function setStatus(text, ok = true) {
   const dot = $('serverState'); if (dot) dot.classList.toggle('bad', !ok);
 }
 
+// "Port 0", "Port 1" 등의 포트 이름을 portmap에서 실제 NIC 이름으로 변환
+function _resolveIfaceValue(val) {
+  if (!val || val === '-') return '';
+  const m = String(val).match(/^port\s*(\d+)$/i);
+  if (!m) return val; // 직접 NIC 이름인 경우 그대로 반환
+  const portIdx = parseInt(m[1]);
+  const entry = state.portmap.find(e => Number(e.port) === portIdx);
+  return entry?.iface || '';
+}
+
 // Build merged local+remote interface list used by scenario lab selects
 function buildAllIfaces() {
   const local  = state.interfaces.map(i => ({ name: i.name, state: i.state, nodeUrl: null, label: 'Local' }));
@@ -115,7 +125,14 @@ function populateInterfaceSelects() {
   const seqRows = _getSeqRows();
   document.querySelectorAll('.sc-row-iface-sel').forEach(sel => {
     const rowIdx = Number(sel.dataset.rowIdx);
-    const cur = seqRows[rowIdx]?._iface || '';
+    const seqRow = seqRows[rowIdx];
+    if (!seqRow) return;
+    // Interface 컬럼에서 _iface 미설정 시 portmap 로드 후 늦은 해석
+    if (!seqRow._iface) {
+      const ifaceVal = seqRow['Interface'] || '';
+      if (ifaceVal && ifaceVal !== '-') seqRow._iface = _resolveIfaceValue(ifaceVal);
+    }
+    const cur = seqRow._iface || '';
     sel.innerHTML = _ifaceSelectOpts(cur);
     sel.value = cur;
   });
@@ -260,8 +277,9 @@ const BLOCK_FIELDS = {
     { id:'dstPort', label:'Dst Port', type:'number', def:'50000' },
   ],
   VLAN: [
-    { id:'vlanId',   label:'VLAN ID',  type:'number', def:'100' },
-    { id:'priority', label:'Priority', type:'number', def:'0' },
+    { id:'vlanId',         label:'VLAN ID',          type:'number', def:'100' },
+    { id:'priority',       label:'Priority',          type:'number', def:'0' },
+    { id:'innerEtherType', label:'Inner EtherType',   type:'text',   def:'' },
   ],
   Payload: [
     { id:'mode', label:'Mode (text/hex)', type:'text', def:'text' },
@@ -922,37 +940,6 @@ function buildDecodeTreeDOM(container, obj, depth) {
 }
 
 // ── Hex / Decode ──────────────────────────────────────────────────────────────
-function decodeHexBasic(hex) {
-  if (!hex || hex.length < 28) return null;
-  const b = hex.match(/.{1,2}/g).map(x => parseInt(x, 16));
-  if (b.length < 14) return null;
-  const eth = {
-    dstMac: b.slice(0,6).map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(':'),
-    srcMac: b.slice(6,12).map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(':'),
-    etherType: `0x${b[12].toString(16).padStart(2,'0').toUpperCase()}${b[13].toString(16).padStart(2,'0').toUpperCase()}`,
-  };
-  const etherType = (b[12] << 8) | b[13];
-  const tree = { Ethernet: eth };
-  if (etherType === 0x0806 && b.length >= 42) {
-    tree.ARP = {
-      operation: (b[20]<<8)|b[21],
-      senderMAC: b.slice(22,28).map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(':'),
-      senderIP:  b.slice(28,32).join('.'),
-      targetMAC: b.slice(32,38).map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(':'),
-      targetIP:  b.slice(38,42).join('.'),
-    };
-  } else if (etherType === 0x0800 && b.length >= 34) {
-    const ihl = (b[14] & 0x0F) * 4;
-    const proto = b[23];
-    tree.IPv4 = { src: b.slice(26,30).join('.'), dst: b.slice(30,34).join('.'), protocol: proto, ttl: b[22], tos: b[21] };
-    const u = 14 + ihl;
-    if (proto === 17 && b.length >= u + 8)  tree.UDP  = { srcPort: (b[u]<<8)|b[u+1], dstPort: (b[u+2]<<8)|b[u+3] };
-    else if (proto === 6 && b.length >= u + 20) tree.TCP  = { srcPort: (b[u]<<8)|b[u+1], dstPort: (b[u+2]<<8)|b[u+3] };
-    else if (proto === 1 && b.length >= u + 4)  tree.ICMP = { type: b[u], code: b[u+1] };
-  }
-  return tree;
-}
-
 function formatHex(hex) {
   if (!hex) return '';
   const bytes = hex.match(/.{1,2}/g) || [];
@@ -972,15 +959,6 @@ function formatHex(hex) {
   return lines.join('\n');
 }
 
-function renderDecodeTree(obj, depth = 0) {
-  if (typeof obj !== 'object' || obj === null) return `${obj}`;
-  return Object.entries(obj).map(([k, v]) => {
-    const indent = '  '.repeat(depth);
-    if (typeof v === 'object' && v !== null && !Array.isArray(v)) return `${indent}▸ ${k}\n${renderDecodeTree(v, depth+1)}`;
-    const val = Array.isArray(v) ? `[${v.join(', ')}]` : String(v);
-    return `${indent}  ${k}: ${val}`;
-  }).join('\n');
-}
 
 function decodeFromBlocks(blocks) {
   const tree = {};
@@ -1115,36 +1093,77 @@ async function sendSelectedPackets() {
 
 async function sendPacketList() {
   if (_pgListRunning) { _pgAbort = true; return; }
-  // Always send in ascending display-index order
   const activePkts = _sortedByDisplayIdx(getActivePackets());
   if (!activePkts.length) { toast('No packets in list', 'warn'); return; }
-  const periodMs = parseInt($('pgPeriod')?.value) || 0;
-  const repeat   = $('pgRepeat')?.checked || false;
+  const periodMs  = parseInt($('pgPeriod')?.value) || 0;
+  const repeat    = $('pgRepeat')?.checked    || false;
+  const parallel  = $('pgParallel')?.checked  || false;
   _pgListRunning = true; _pgAbort = false;
-  const listBtn = $('pgSendList');
-  if (listBtn) { listBtn.textContent = '■ Stop'; listBtn.style.cssText = 'background:var(--red);border-color:var(--red);color:#fff;'; }
+  const listBtn    = $('pgSendList');
   const pgSpinnerL = $('pgSpinner');
+  const listStats  = $('pgStatsText');
+  if (listBtn) { listBtn.textContent = '■ Stop'; listBtn.style.cssText = 'background:var(--red);border-color:var(--red);color:#fff;'; }
   if (pgSpinnerL) pgSpinnerL.style.display = 'inline-block';
-  const listStats = $('pgStatsText');
   const t0list = new Date();
 
   let totalSent = 0, totalAttempts = 0, cycle = 0;
   do {
     cycle++;
     if (listStats) listStats.textContent = `시작: ${t0list.toLocaleTimeString()} | 종료: — | 주기: ${cycle} | 전송 중…`;
-    for (let i = 0; i < activePkts.length; i++) {
-      if (_pgAbort) break;
-      const pkt = activePkts[i];
-      if (!pkt.interface) { pkt.status = 'ERR'; toast(`Packet "${pkt.name}": 인터페이스 미설정`, 'bad'); renderPacketList(); continue; }
-      try {
-        pkt.status = 'Running'; renderPacketList();
-        await api(_pktSendUrl(pkt.interface), { method:'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
-        pkt.status = 'Sent'; totalSent++;
-      } catch (err) { pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad'); }
-      totalAttempts++;
+
+    if (parallel) {
+      // ── 병렬 모드: 인터페이스별 그룹화 후 동시 전송 ──────────────────────
+      const ifaceGroups = new Map();
+      for (const pkt of activePkts) {
+        if (!pkt.interface) {
+          pkt.status = 'ERR'; renderPacketList();
+          toast(`Packet "${pkt.name}": 인터페이스 미설정`, 'bad');
+          continue;
+        }
+        if (!ifaceGroups.has(pkt.interface)) ifaceGroups.set(pkt.interface, []);
+        ifaceGroups.get(pkt.interface).push(pkt);
+      }
+
+      for (const pkt of activePkts) { if (pkt.interface) { pkt.status = 'Running'; } }
       renderPacketList();
-      if (periodMs > 0 && !_pgAbort) await new Promise(r => setTimeout(r, periodMs));
+
+      const groupResults = await Promise.all(
+        [...ifaceGroups.values()].map(async group => {
+          let sent = 0;
+          for (const pkt of group) {
+            if (_pgAbort) break;
+            try {
+              await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
+              pkt.status = 'Sent'; sent++;
+            } catch (err) {
+              pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad');
+            }
+          }
+          return sent;
+        })
+      );
+
+      totalSent     += groupResults.reduce((a, b) => a + b, 0);
+      totalAttempts += activePkts.filter(p => p.interface).length;
+      renderPacketList();
+
+    } else {
+      // ── 순차 모드: 기존 동작 ──────────────────────────────────────────────
+      for (let i = 0; i < activePkts.length; i++) {
+        if (_pgAbort) break;
+        const pkt = activePkts[i];
+        if (!pkt.interface) { pkt.status = 'ERR'; toast(`Packet "${pkt.name}": 인터페이스 미설정`, 'bad'); renderPacketList(); continue; }
+        try {
+          pkt.status = 'Running'; renderPacketList();
+          await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
+          pkt.status = 'Sent'; totalSent++;
+        } catch (err) { pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad'); }
+        totalAttempts++;
+        renderPacketList();
+        if (periodMs > 0 && !_pgAbort) await new Promise(r => setTimeout(r, periodMs));
+      }
     }
+
     if (_pgAbort) break;
   } while (repeat && !_pgAbort);
 
@@ -1199,6 +1218,21 @@ function icmpTypeHint(v) {
 }
 
 const FIELD_HINT_FN = { etherType: etherTypeHint, protocol: ipProtoHint, icmpType: icmpTypeHint };
+
+// "Port N" 형식의 인터페이스 컬럼을 portmap 기반 실제 iface명으로 변환
+// portmap 미매칭 시 '' 반환 (선택 없음)
+function _buildFrameRefIfaceMap(packetRows) {
+  const map = new Map();
+  for (const r of packetRows) {
+    const ref   = (r['FrameRef']  || '').trim();
+    const ifCol = (r['Interface'] || '').trim();
+    if (!ref || ref === '-' || !ifCol || ifCol === '-') continue;
+    const portNum = parseInt(ifCol.replace(/[^0-9]/g, ''), 10);
+    const entry   = isNaN(portNum) ? null : state.portmap.find(e => Number(e.port) === portNum);
+    map.set(ref, entry?.iface || '');
+  }
+  return map;
+}
 
 function normEtherType(v) {
   if (!v) return '0x0800';
@@ -1348,25 +1382,94 @@ function findNearestPacketCsv(filePath) {
 }
 
 function parseTcCsvToPackets(rows, frameRefToIdx) {
+  // Group rows by FrameRef, preserving layer order via the Layer column
   const map = new Map();
   for (const row of rows) {
     const ref = row['FrameRef'] || '';
     if (!ref) continue;
-    if (!map.has(ref)) map.set(ref, { name: ref, dstMac: '', srcMac: '', etherType: '0x0800', rawHex: '' });
+    if (!map.has(ref)) map.set(ref, { name: ref, layers: [] });
     const g     = map.get(ref);
+    const layer = parseInt(row['Layer'] || '1', 10) || 1;
     const proto = (row['Protocol'] || '').toUpperCase();
     const field = row['Field'] || '';
     const value = (row['Value'] || '').trim();
-    if (proto === 'ETH') {
-      if (field === 'Destination MAC') g.dstMac = value;
-      else if (field === 'Source MAC')  g.srcMac = value;
-      else if (field === 'EtherType')   g.etherType = normEtherType(value);
-    } else if (proto === 'RAW') {
-      g.rawHex = value.replace(/^0x/i, '');
-    }
+
+    // Find or create a slot for this (layer, proto) pair
+    let slot = g.layers.find(l => l.layer === layer && l.proto === proto);
+    if (!slot) { slot = { layer, proto, fields: {} }; g.layers.push(slot); }
+    slot.fields[field] = value;
   }
+
   return [...map.values()].map((g, i) => {
-    // Use scenario CSV Index column value if available, else fall back to FrameRef suffix
+    // Sort layers by layer number so blocks come out in CSV order
+    g.layers.sort((a, b) => a.layer - b.layer || a.proto.localeCompare(b.proto));
+
+    const blocks = [];
+    for (const { proto, fields } of g.layers) {
+      if (proto === 'ETH') {
+        blocks.push({
+          type:      'Ethernet',
+          dstMac:    fields['Destination MAC'] || 'FF:FF:FF:FF:FF:FF',
+          srcMac:    fields['Source MAC']      || '00:00:00:00:00:00',
+          etherType: normEtherType(fields['EtherType'] || '0x0800'),
+        });
+      } else if (proto === 'VLAN') {
+        const inner = fields['EtherType'] || fields['InnerEtherType'] || '';
+        blocks.push({
+          type:           'VLAN',
+          vlanId:         parseInt(fields['VLAN ID'] || fields['VID'] || '100', 10),
+          priority:       parseInt(fields['Priority'] || fields['PCP'] || '0', 10),
+          innerEtherType: inner ? normEtherType(inner) : '',
+        });
+      } else if (proto === 'ARP') {
+        blocks.push({
+          type:      'ARP',
+          operation: parseInt(fields['Operation'] || '1', 10),
+          senderMac: fields['Sender MAC'] || '00:00:00:00:00:00',
+          senderIp:  fields['Sender IP']  || '0.0.0.0',
+          targetMac: fields['Target MAC'] || '00:00:00:00:00:00',
+          targetIp:  fields['Target IP']  || '0.0.0.0',
+        });
+      } else if (proto === 'IPV4' || proto === 'IP') {
+        blocks.push({
+          type:   'IPv4',
+          srcIp:  fields['Src IP']  || fields['Source IP']      || '192.168.1.1',
+          dstIp:  fields['Dst IP']  || fields['Destination IP'] || '192.168.1.2',
+          ttl:    parseInt(fields['TTL'] || '64', 10),
+          tos:    parseInt(fields['TOS'] || '0',  10),
+        });
+      } else if (proto === 'ICMP') {
+        blocks.push({
+          type:     'ICMP',
+          icmpType: parseInt(fields['Type'] || '8', 10),
+          icmpCode: parseInt(fields['Code'] || '0', 10),
+        });
+      } else if (proto === 'UDP') {
+        blocks.push({
+          type:    'UDP',
+          srcPort: parseInt(fields['Src Port'] || fields['Source Port'] || '12345', 10),
+          dstPort: parseInt(fields['Dst Port'] || fields['Destination Port'] || '50000', 10),
+        });
+      } else if (proto === 'TCP') {
+        blocks.push({
+          type:    'TCP',
+          srcPort: parseInt(fields['Src Port'] || fields['Source Port'] || '1234', 10),
+          dstPort: parseInt(fields['Dst Port'] || fields['Destination Port'] || '80', 10),
+          flags:   parseInt(fields['Flags'] || '0x02', 16),
+          seqNum:  parseInt(fields['Seq'] || fields['Sequence'] || '0', 10),
+          ackNum:  parseInt(fields['Ack'] || fields['Acknowledge'] || '0', 10),
+        });
+      } else if (proto === 'RAW') {
+        const hex = (fields['Data'] || fields['Value'] || '').replace(/^0x/i, '');
+        if (hex) blocks.push({ type: 'Payload', mode: 'hex', data: hex });
+      }
+    }
+
+    // Ensure at least an Ethernet block exists
+    if (!blocks.find(b => b.type === 'Ethernet')) {
+      blocks.unshift({ type: 'Ethernet', dstMac: 'FF:FF:FF:FF:FF:FF', srcMac: '00:00:00:00:00:00', etherType: '0x0800' });
+    }
+
     let originalOrder;
     if (frameRefToIdx && frameRefToIdx.has(g.name)) {
       originalOrder = frameRefToIdx.get(g.name);
@@ -1378,13 +1481,10 @@ function parseTcCsvToPackets(rows, frameRefToIdx) {
       id:           Date.now() + Math.random() + i,
       name:         g.name,
       originalOrder,
-      blocks:    [
-        { type:'Ethernet', dstMac: g.dstMac||'FF:FF:FF:FF:FF:FF', srcMac: g.srcMac||'00:00:00:00:00:00', etherType: g.etherType },
-        ...(g.rawHex ? [{ type:'Payload', mode:'hex', data: g.rawHex }] : []),
-      ],
-      status:    '',
-      checked:   false,
-      interface: '',
+      blocks,
+      status:       '',
+      checked:      false,
+      interface:    '',
     };
   });
 }
@@ -1441,12 +1541,15 @@ async function selectTcCsv(filePath) {
   try {
     const tcData = await api(`/api/testcases/csv-content?path=${encodeURIComponent(filePath)}`);
     const tcRows = tcData.rows || [];
-    const frameRefs = new Set(
-      tcRows
-        .filter(r => (r['EventType'] || '').toLowerCase() === 'packet')
-        .map(r => (r['FrameRef'] || '').trim())
-        .filter(r => r && r !== '-')
+    const packetRows = tcRows.filter(r => (r['EventType'] || '').toLowerCase() === 'packet');
+    const frameRefs  = new Set(
+      packetRows.map(r => (r['FrameRef'] || '').trim()).filter(r => r && r !== '-')
     );
+
+    // FrameRef → 실제 인터페이스명 매핑 (portmap 기반)
+    // portmap이 아직 한 번도 로드 안 된 경우에만 갱신
+    if (!state.portmap.length) await _loadPortmapSilent();
+    const frameRefToIface = _buildFrameRefIfaceMap(packetRows);
 
     let tcPackets = [];
     const packetsCsvPath = findNearestPacketCsv(filePath);
@@ -1462,6 +1565,10 @@ async function selectTcCsv(filePath) {
       tcPackets = frameRefs.size
         ? parseTcCsvToPackets(allRows.filter(r => frameRefs.has(r['FrameRef'])))
         : [];
+      // 인터페이스 자동 매치
+      for (const pkt of tcPackets) {
+        if (frameRefToIface.has(pkt.name)) pkt.interface = frameRefToIface.get(pkt.name);
+      }
     } else {
       state.tcNextFrameRef = 0;
     }
@@ -1619,6 +1726,8 @@ function formatCaptureRow(r) {
     source, destination: dest, protocol, length: r.length, info,
     direction: r.direction || '',
     detailText: JSON.stringify(r.decoded || {}, null, 2),
+    decoded: r.decoded || {},
+    frameHex: r.frameHex || r.hex || '',
     hexDump: formatHex(r.frameHex || r.hex || ''),
     timeRaw: r.timestamp || 0,
   };
@@ -1745,8 +1854,8 @@ async function clearCapture() {
     state.captureIfaceFilter = new Set();
     updateCaptureIfaceFilters();
     renderCaptureRows();
-    if ($('packetDetails')) $('packetDetails').textContent = 'Select a packet.';
-    if ($('packetHex'))     $('packetHex').textContent = '';
+    if ($('packetDetails')) $('packetDetails').innerHTML = '<span style="color:var(--muted)">Select a packet.</span>';
+    if ($('packetHex'))     $('packetHex').innerHTML = '';
     await refreshCaptureStatus();
   } catch { /* ignore */ }
 }
@@ -1883,8 +1992,14 @@ function renderCaptureRows() {
       tbody.querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
       tr.classList.add('selected');
       const row = rows[Number(tr.dataset.idx)];
-      if ($('packetDetails')) $('packetDetails').textContent = row.detailText || 'No detail.';
-      if ($('packetHex'))     $('packetHex').textContent = row.hexDump || '';
+      const detEl = $('packetDetails');
+      if (detEl) {
+        detEl.innerHTML = '';
+        detEl.dataset.json = row.detailText || '{}';
+        buildDecodeTreeDOM(detEl, row.decoded || {}, 0);
+        if (!detEl.children.length) detEl.innerHTML = '<span style="color:var(--muted)">No detail.</span>';
+      }
+      if ($('packetHex')) $('packetHex').innerHTML = renderHexHTML(row.frameHex || '');
     });
   });
 }
@@ -1897,29 +2012,16 @@ function downloadCaptureCsv() {
 // ── Scenario Lab ──────────────────────────────────────────────────────────────
 async function loadTestCases() {
   try {
-    const data = await api('/api/testcases/status');
-    const snapshot = data.snapshot || data.testCases || [];
-    const allGroups = Array.isArray(snapshot) ? snapshot : (snapshot.groups || []);
-    // Filter out legacy isPacketDef groups and root-folder groups
-    const groups = allGroups.filter(g => !g.isPacketDef && g.name !== '(root)');
-    const hasRealCases = groups.some(g => (g.cases || []).length > 0);
-    if (!hasRealCases) {
-      // Auto-import CSV files if no test cases exist yet
-      const scan = await api('/api/testcases/scan-scenarios').catch(() => null);
-      if (scan?.files?.length) {
-        await api('/api/testcases/import-all-csv', { method: 'POST', body: '{}' }).catch(() => null);
-        const d2 = await api('/api/testcases/status');
-        const g2 = d2.snapshot || [];
-        const groups2 = (Array.isArray(g2) ? g2 : (g2.groups || [])).filter(g => !g.isPacketDef && g.name !== '(root)');
-        renderTcTree(groups2);
-        return;
-      }
-    }
+    // CSV에서 직접 읽어 Test_Scenario_ID → TC_ID 순 정렬된 그룹 사용
+    const data = await api('/api/testcases/sorted-groups');
+    const groups = (data.groups || []).filter(g => !g.isPacketDef && g.name !== '(root)');
     renderTcTree(groups);
   } catch { /* ignore */ }
 }
 
 async function loadSequence() {
+  // CSV 모드(시나리오 탭에서 TC/CSV 로드된 상태)에서는 서버 시퀀스로 덮어쓰지 않음
+  if (state.selectedCsvPath || state.tcSeqList.length) return;
   try {
     const data = await api('/api/sequence/full');
     const items = data.items || [];
@@ -1982,10 +2084,13 @@ function seqEventSummary(item) {
   if (t === 'fdbwrite')        return `MAC:${item.mac}  Port:${item.port}`;
   if (t === 'fdbwritebucket')  return `MAC:${item.mac}  Bucket:${item.bucket}  Slot:${item.slot}`;
   if (t === 'fdbread')         return `MAC:${item.mac}`;
+  if (t === 'fdbverify')       return `MAC:${item.mac}  Port:${item.expectedPort}${item.expectedAbsent==='1'||item.expectedAbsent===true?' (absent)':''}`;
+
   if (t === 'fdbreadbucket')   return `Bucket:${item.bucket}  Slot:${item.slot}`;
   if (t === 'fdbwaitfor')      return `MAC:${item.mac}`;
   if (t === 'fdbinitialize')   return 'flush all';
-  if (t === 'rxverify')        return `if:${item.captureInterface||'?'}  filter:${item.captureFilter||''}  expect:${item.captureExpected||1}`;
+  if (t === 'rxverify')        return `expected:${item.expected||'?'}  timeout:${item.timeoutMs||''}`;
+
   return JSON.stringify(item).slice(0,60);
 }
 
@@ -2130,30 +2235,48 @@ const EVENT_FIELDS = {
   FdbRead:        [{ id:'mac',       label:'MAC',        type:'text',     def:'00:00:00:00:00:00' },
                    { id:'vlanId',    label:'VLAN ID',    type:'number',   def:'0' },
                    { id:'vlanValid', label:'VLAN Valid', type:'checkbox', def:false }],
+  FdbVerify:      [{ id:'mac',            label:'MAC',             type:'text',     def:'00:00:00:00:00:00' },
+                   { id:'vlanId',         label:'VLAN ID',         type:'number',   def:'0' },
+                   { id:'vlanValid',      label:'VLAN Valid',      type:'checkbox', def:false },
+                   { id:'expectedPort',   label:'Expected Port',   type:'text',     def:'0' },
+                   { id:'expectedAbsent', label:'Expected Absent', type:'checkbox', def:false }],
   FdbReadBucket:  [{ id:'bucket',           label:'Bucket',          type:'number', def:'0' },
-                   { id:'slot',             label:'Slot (hex)',       type:'text',   def:'0x1' }],
-  FdbInitialize:  [],
-  RxVerify:       [{ id:'captureInterface', label:'Interface',       type:'text',   def:'' },
-                   { id:'captureFilter',    label:'Filter (text)',   type:'text',   def:'' },
-                   { id:'captureExpected',  label:'Min frames',      type:'number', def:'1' }],
+                   { id:'slot',             label:'Slot (hex)',       type:'text',   def:'0x1' },
+                   { id:'expected',         label:'Expected MAC',     type:'text',   def:'' },
+                   { id:'expectedStatic',   label:'Expected Type (static/dynamic, 빈값=검증안함)', type:'text', def:'' }],
+  FdbInitialize:    [],
+  RxVerify:         [{ id:'expected',  label:'Expected (port bitmask)', type:'text', def:'0b000001' },
+                     { id:'timeoutMs', label:'Timeout',                 type:'text', def:'1000ms'   }],
+  RxCapture:        [{ id:'timeoutMs', label:'Timeout',                 type:'text', def:'1000ms'   }],
+  BranchTo: [
+    { id:'gotoIndex',      label:'Goto Index',       type:'number', def:'' },
+    { id:'gotoScenarioId', label:'Goto Scenario ID', type:'text',   def:'' },
+    { id:'gotoTcId',       label:'Goto TC ID',       type:'text',   def:'' },
+    { id:'gotoValue',      label:'Goto Value',       type:'text',   def:'' },
+    { id:'maxIterations',  label:'Max Iterations',   type:'number', def:'10' },
+  ],
+  Break: [],
 };
 
 const EVENT_API_TYPE = {
-  Delay:'delay', RegWrite:'registerWrite', RegRead:'registerRead', RegVerify:'registerExpect',
-  FdbWrite:'fdbWrite', FdbWriteBucket:'fdbWriteBucket', FdbRead:'fdbRead', FdbReadBucket:'fdbReadBucket',
-  FdbInitialize:'fdbInitialize', RxVerify:'rxVerify',
+  Delay:'delay', RegWrite:'regwrite', RegRead:'regread', RegVerify:'regverify',
+  FdbWrite:'fdbwrite', FdbWriteBucket:'fdbwritebucket', FdbRead:'fdbread', FdbReadBucket:'fdbreadbucket',
+  FdbVerify:'fdbverify', FdbInitialize:'fdbinitialize', RxVerify:'rxverify', RxCapture:'rxcapture',
+  BranchTo:'branchto', Break:'break',
 };
 
 // Reverse map: lowercased API-type string → EVENT_FIELDS kind key
 const EVENT_KIND_BY_API_TYPE = (() => {
   const m = {};
   for (const [k, v] of Object.entries(EVENT_API_TYPE)) m[v.toLowerCase()] = k;
-  // Short display-name aliases used in CSV EventType column
-  m['regwrite']      = 'RegWrite';
-  m['regread']       = 'RegRead';
-  m['regverify']     = 'RegVerify';
-  m['fdbinitialize'] = 'FdbInitialize';
-  m['packet']        = 'Packet';
+  // Legacy aliases from older CSV files
+  m['registerwrite']  = 'RegWrite';
+  m['registerread']   = 'RegRead';
+  m['registerverify'] = 'RegVerify';
+  m['registerexpect'] = 'RegVerify';
+  m['fdbflush']       = 'FdbInitialize';
+  m['branchto'] = 'BranchTo';
+  m['break']    = 'Break';
   return m;
 })();
 
@@ -2171,12 +2294,20 @@ function getRowField(row, fieldId) {
     bucket:           ['Bucket'],
     slot:             ['Slot'],
     expected:         ['Expected'],
+    expectedStatic:   ['ExpectedStatic', 'Static', 'static'],
     mask:             ['Mask'],
     timeoutMs:        ['Timeout', 'timeout'],
     delayMs:          ['Timeout', 'timeout', 'DelayMs'],
     captureInterface: ['CaptureInterface'],
     captureFilter:    ['CaptureFilter', 'Filter'],
     captureExpected:  ['CaptureExpected'],
+    expectedPort:     ['ExpectedPort'],
+    expectedAbsent:   ['ExpectedAbsent'],
+    gotoIndex:        ['GotoIndex', 'gotoindex'],
+    gotoScenarioId:   ['GotoScenarioID', 'GotoScenarioId', 'gotoscenarioid'],
+    gotoTcId:         ['GotoTC_ID', 'GotoTcId', 'gotctcid'],
+    gotoValue:        ['GotoValue', 'gotovalue'],
+    maxIterations:    ['MaxIterations', 'maxiterations'],
   };
   for (const alt of (csvAlt[fieldId] || [])) {
     const a = row[alt];
@@ -2260,11 +2391,16 @@ function updateRowFromEditor() {
       bucket: 'Bucket', slot: 'Slot', expected: 'Expected', mask: 'Mask',
       timeoutMs: 'Timeout', delayMs: 'Timeout',
       captureInterface: 'CaptureInterface', captureFilter: 'CaptureFilter', captureExpected: 'CaptureExpected',
+      expectedPort: 'ExpectedPort', expectedAbsent: 'ExpectedAbsent',
+      gotoIndex: 'GotoIndex', gotoScenarioId: 'GotoScenarioID', gotoTcId: 'GotoTC_ID',
+      gotoValue: 'GotoValue', maxIterations: 'MaxIterations',
     };
     for (const f of EVENT_FIELDS[kind] || []) {
       const el = $(`eef-${f.id}`); if (!el) continue;
       const val = f.type === 'number' ? Number(el.value) : f.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
-      row[toCSV[f.id] || f.id] = String(val);
+      const csvKey = toCSV[f.id] || f.id;
+      row[csvKey] = String(val);
+      if (csvKey !== f.id) row[f.id] = String(val); // camelCase 키도 동기화 (getRowField 우선순위)
     }
     _setSeqRows(rows);
   }
@@ -2311,6 +2447,33 @@ async function addEventFromEditor() {
   const btn = $('addToSequence');
   const kind = btn?.dataset.evKind;
   if (!kind) return;
+
+  // CSV 모드: 서버 API 대신 로컬 시퀀스에 직접 추가 (renderSequenceRows 호출 방지)
+  if (state.selectedCsvPath || state.tcSeqList.length) {
+    const toCSV = {
+      address:'Address', value:'Value', mac:'MAC', vlanId:'VlanID', vlanValid:'VlanValid', port:'Port',
+      bucket:'Bucket', slot:'Slot', expected:'Expected', expectedStatic:'ExpectedStatic', mask:'Mask',
+      timeoutMs:'Timeout', delayMs:'Timeout',
+      captureInterface:'CaptureInterface', captureFilter:'CaptureFilter', captureExpected:'CaptureExpected',
+      gotoIndex:'GotoIndex', gotoScenarioId:'GotoScenarioID', gotoTcId:'GotoTC_ID',
+      gotoValue:'GotoValue', maxIterations:'MaxIterations',
+    };
+    const newRow = { Name: kind, EventType: EVENT_API_TYPE[kind] || kind, MAC: '-', Timeout: '' };
+    for (const f of EVENT_FIELDS[kind] || []) {
+      const el = $(`eef-${f.id}`); if (!el) continue;
+      const val = f.type === 'number' ? Number(el.value) : f.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+      newRow[toCSV[f.id] || f.id] = String(val);
+    }
+    const rows = _getSeqRows();
+    const idx = state.selectedSeqRowIdx >= 0 ? state.selectedSeqRowIdx + 1 : rows.length;
+    rows.splice(idx, 0, newRow);
+    state.selectedSeqRowIdx = idx;
+    _setSeqRows(rows);
+    toast(`${kind} added`, 'ok');
+    return;
+  }
+
+  // 레거시: 서버 시퀀스 API 경로
   const event = { eventType: EVENT_API_TYPE[kind] || kind.toLowerCase() };
   for (const f of EVENT_FIELDS[kind] || []) {
     const el = $(`eef-${f.id}`); if (!el) continue;
@@ -2725,6 +2888,13 @@ function renderCsvSequence(rows) {
     tbody.innerHTML = '';
     return;
   }
+  // Packet 행의 Interface 컬럼("Port 0" 등)을 _iface로 해석 (미설정인 경우만)
+  rows.forEach(row => {
+    if ((row['EventType'] || '').toLowerCase() === 'packet' && !row._iface) {
+      const ifaceVal = row['Interface'] || '';
+      if (ifaceVal && ifaceVal !== '-') row._iface = _resolveIfaceValue(ifaceVal);
+    }
+  });
   tbody.innerHTML = rows.map((row, i) => {
     const idx     = row['Index'] !== undefined ? row['Index'] : String(i + 1);
     const name    = row['Name'] || '';
@@ -2736,7 +2906,7 @@ function renderCsvSequence(rows) {
     const rStyle   = result === 'Done' ? ';color:var(--green)' : result === 'Fail' ? ';color:var(--red)' : '';
     const isPacket = evType.toLowerCase() === 'packet';
     const ifaceCell = isPacket
-      ? `<select name="sc-row-iface-${i}" class="sc-row-iface-sel small-select" data-row-idx="${i}" style="width:140px;font-size:10px;">
+      ? `<select name="sc-row-iface-${i}" class="sc-row-iface-sel small-select" data-row-idx="${i}" style="width:100%;font-size:10px;">
            ${_ifaceSelectOpts(row._iface || '')}
          </select>`
       : '';
@@ -3191,7 +3361,9 @@ async function executeEvent(row, iface, ctx = {}) {
     if (!offset || offset === '-') return { ok: false, error: 'No Address' };
     try {
       const data = await api('/api/register/read', { method: 'POST', body: JSON.stringify({ offset }) });
-      return data.ok !== false ? { ok: true, detail: data.value || '' } : { ok: false, error: data.error || 'Read failed' };
+      return data.ok !== false
+        ? { ok: true, detail: data.value || '', values: { value: (data.value || '').toLowerCase() } }
+        : { ok: false, error: data.error || 'Read failed' };
     } catch (e) { return { ok: false, error: e.message }; }
   }
 
@@ -3273,26 +3445,94 @@ async function executeEvent(row, iface, ctx = {}) {
     try {
       const data = await api('/api/fdb/read', { method: 'POST', body: JSON.stringify({ mac, vlanId, vlanValid }) });
       if (data.ok === false) return { ok: false, error: data.error || 'FDB read failed' };
-      const found = data.entry?.found ?? false;
-      return found ? { ok: true, detail: JSON.stringify(data.entry) } : { ok: false, error: `MAC not found: ${mac}` };
+      const e = data.entry || {};
+      const detail = e.found
+        ? `found mac=${e.mac} port=${e.port} bucket=${e.bucket}`
+        : `not found: ${mac}`;
+      const values = {
+        found:  String(!!e.found),
+        mac:    (e.mac    || '').toLowerCase(),
+        port:   String(e.port   ?? ''),
+        bucket: String(e.bucket ?? ''),
+        static: String(!!e.static),
+      };
+      return { ok: true, detail, values };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+
+  // ── FdbVerify ─────────────────────────────────────────────────────────────────
+  if (evType === 'fdbverify') {
+    const mac            = row['MAC'] || row['mac'] || '';
+    const vlanId         = parseInt(row['VlanID'] || row['VlanId'] || row['vlanid'] || '0') || 0;
+    const vlanValid      = parseVlanValid(row);
+    const expectedPort   = parseBinPort(row['ExpectedPort'] || row['expectedPort'] || '0');
+    const rawAbsent      = row['ExpectedAbsent'] || row['expectedAbsent'] || '';
+    const expectedAbsent = ['1','y','yes','true'].includes(String(rawAbsent).toLowerCase().trim()) || rawAbsent === true;
+    if (!mac || mac === '-') return { ok: false, error: 'No MAC' };
+    try {
+      const data = await api('/api/fdb/read', { method: 'POST', body: JSON.stringify({ mac, vlanId, vlanValid }) });
+      if (data.ok === false) return { ok: false, error: data.error || 'FDB read failed' };
+      const entry = data.entry || {};
+      if (expectedAbsent) {
+        return entry.found
+          ? { ok: false, error: `Expected absent but MAC found (port=${entry.port})` }
+          : { ok: true, detail: `absent confirmed` };
+      }
+      if (!entry.found) return { ok: false, error: `MAC not found: ${mac}` };
+      const portMatch = (entry.port & 0x1FF) === (expectedPort & 0x1FF);
+      return portMatch
+        ? { ok: true,  detail: `port=${entry.port} (expected ${expectedPort})` }
+        : { ok: false, error: `Port mismatch: got ${entry.port}, expected ${expectedPort}` };
     } catch (e) { return { ok: false, error: e.message }; }
   }
 
   // ── FdbReadBucket (TC_BucketCapacityCheck: Bucket, Slot, Expected=MAC) ────────
   if (evType === 'fdbreadbucket') {
     const bucket   = parseInt(row['Bucket'] || row['bucket'] || '0') || 0;
-    const slotMask = parseInt(String(row['Slot'] || row['slot'] || '0').replace(/^0x/i,''), 16) || 0;
+    const slotMask = parseInt(String(row['Slot'] || row['slot'] || '0x1').replace(/^0x/i,''), 16) || 1;
     const expected = (row['Expected'] || row['expected'] || '').trim();
     try {
       const data = await api('/api/fdb/read-bucket', { method: 'POST', body: JSON.stringify({ bucket, slot: slotMask }) });
       if (data.ok === false) return { ok: false, error: data.error || 'FdbReadBucket failed' };
-      if (expected && expected !== '-') {
-        const got = (data.entry?.mac || '').toUpperCase();
-        const exp = expected.toUpperCase();
-        return got === exp ? { ok: true, detail: `bucket=${bucket} slot=0x${slotMask.toString(16)} mac=${got}` }
-                           : { ok: false, error: `MAC mismatch: got ${got}, expected ${exp}` };
+      const ent = data.entry || {};
+      const values = {
+        found:  String(!!ent.found),
+        mac:    (ent.mac  || '').toLowerCase(),
+        port:   String(ent.port   ?? ''),
+        bucket: String(ent.bucket ?? bucket),
+        slot:   String(ent.slot   ?? slotMask),
+        static: String(!!ent.static),
+      };
+      // 기대 static/dynamic (옵션): ExpectedStatic/Static 컬럼.
+      //   static|true|1|yes → static,  dynamic|false|0|no → dynamic,  빈값/'-' → 검증 안 함
+      const rawStatic = String(row['ExpectedStatic'] || row['expectedStatic'] ||
+                               row['Static'] || row['static'] || '').trim().toLowerCase();
+      let expStatic = null;
+      if (rawStatic && rawStatic !== '-') {
+        if (['static', 'true', '1', 'yes'].includes(rawStatic))       expStatic = true;
+        else if (['dynamic', 'false', '0', 'no'].includes(rawStatic)) expStatic = false;
       }
-      return { ok: true, detail: JSON.stringify(data.entry || {}) };
+
+      const mismatches = [];
+      if (expected && expected !== '-') {
+        const got = (ent.mac || '').toUpperCase();
+        const exp = expected.toUpperCase();
+        if (got !== exp) mismatches.push(`MAC: got ${got}, expected ${exp}`);
+      }
+      if (expStatic !== null) {
+        const gotStatic = !!ent.static;
+        if (gotStatic !== expStatic)
+          mismatches.push(`type: got ${gotStatic ? 'static' : 'dynamic'}, expected ${expStatic ? 'static' : 'dynamic'}`);
+      }
+
+      // 비교 대상이 하나도 없으면 기존처럼 원시 정보만 반환
+      if (!(expected && expected !== '-') && expStatic === null)
+        return { ok: true, detail: JSON.stringify(ent), values };
+
+      if (mismatches.length) return { ok: false, error: mismatches.join('; '), values };
+
+      const typeStr = expStatic !== null ? ` (${ent.static ? 'static' : 'dynamic'})` : '';
+      return { ok: true, detail: `bucket=${bucket} slot=0x${slotMask.toString(16)} mac=${(ent.mac || '').toUpperCase()}${typeStr}`, values };
     } catch (e) { return { ok: false, error: e.message }; }
   }
 
@@ -3315,45 +3555,366 @@ async function executeEvent(row, iface, ctx = {}) {
     } catch (e) { return { ok: false, error: e.message }; }
   }
 
-  // ── RxVerify — capture frames and verify count ───────────────────────────────
+  // ── RxVerify — 포트 비트맵 기반 수신 검증 ───────────────────────────────────
   if (evType === 'rxverify') {
-    const captureIface    = row['CaptureInterface'] || row['captureInterface'] || row['Interface'] || '';
-    const captureExpected = parseInt(row['CaptureExpected'] || row['captureExpected'] || '1') || 1;
-    const timeoutMs       = parseInt(row['Timeout'] || row['timeout'] || '3000') || 3000;
-    // Use Expected (dst MAC) as filter; fall back to CaptureFilter
-    const rawFilter = (row['Expected'] || row['expected'] || row['CaptureFilter'] || row['captureFilter'] || '').trim();
-    const macFilter = /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(rawFilter)
-      ? rawFilter.replace(/:/g, '').toLowerCase()
-      : rawFilter.toLowerCase();
+    const expectedBitmap = parseBinPort(row['Expected'] || row['expected'] || '0');
+    const timeoutMs      = parseInt(row['Timeout'] || row['timeout'] || '1000') || 1000;
+
+    // 비트맵에서 기대 포트 번호 추출 (0b000000이면 "수신 없어야 함" 검증)
+    const expectedPorts = [];
+    for (let i = 0; i < 8; i++) { if (expectedBitmap & (1 << i)) expectedPorts.push(i); }
+
+    // portmap → 로컬 / Node B 분리
+    // expected=0b000000이면 전체 포트 대상으로 캡처 ("수신 없어야 함" 검증)
+    const scanPorts = expectedPorts.length
+      ? expectedPorts
+      : state.portmap.map(e => Number(e.port));
+    const localIfaces = [], nodeBIfaceMap = new Map();
+    for (const p of scanPorts) {
+      const entry = state.portmap.find(e => Number(e.port) === p);
+      if (!entry?.iface) continue;
+      if (entry.nodeUrl) {
+        const list = nodeBIfaceMap.get(entry.nodeUrl) || [];
+        list.push(entry.iface);
+        nodeBIfaceMap.set(entry.nodeUrl, list);
+      } else {
+        localIfaces.push(entry.iface);
+      }
+    }
+    if (!localIfaces.length && !nodeBIfaceMap.size) {
+      return { ok: false, error: `RxVerify: portmap에 0b${expectedBitmap.toString(2)} 해당 포트 없음 — Settings 확인` };
+    }
+
+    // 폴링 시 모든 Node B URL 대상 (expected 외 포트 수신도 감지)
+    const allNodeBUrls = [...new Set(
+      state.portmap.filter(e => e.nodeUrl).map(e => e.nodeUrl)
+    )];
+
     try {
       if (!ctx.capturePrestarted) {
-        // Capture was NOT pre-started — clear buffer and start now
-        // (sent frame was already recorded as TX by packetBackend, so it survives the clear
-        //  only when pre-started; without pre-start we accept missing the specific TX frame)
-        await api('/api/capture/clear', { method: 'POST', body: '{}' });
-        const ifaces = captureIface ? [captureIface] : [];
-        await api('/api/capture/start', { method: 'POST', body: JSON.stringify({ interfaces: ifaces }) });
+        // portmap 전체 인터페이스 캡처 시작
+        const allLocalIfaces = state.portmap.filter(e => !e.nodeUrl && e.iface).map(e => e.iface);
+        const allNodeBIfaceMap = new Map();
+        for (const e of state.portmap.filter(e => e.nodeUrl && e.iface)) {
+          const list = allNodeBIfaceMap.get(e.nodeUrl) || [];
+          list.push(e.iface);
+          allNodeBIfaceMap.set(e.nodeUrl, list);
+        }
+
+        const clearPs = [api('/api/capture/clear', { method: 'POST', body: '{}' })];
+        for (const url of allNodeBUrls)
+          clearPs.push(fetch(`${url}/api/capture/clear`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
+        await Promise.all(clearPs);
+
+        const startPs = [];
+        if (allLocalIfaces.length)
+          startPs.push(api('/api/capture/start', { method: 'POST', body: JSON.stringify({ interfaces: allLocalIfaces, promisc: true }) }));
+        for (const [url, ifaces] of allNodeBIfaceMap)
+          startPs.push(fetch(`${url}/api/capture/start`, { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ interfaces: ifaces, promisc: true }) }).catch(() => {}));
+        await Promise.all(startPs);
       }
 
       const deadline = Date.now() + timeoutMs;
-      let matched = 0;
+      const receivedPorts = new Set();
+      const expectNone = expectedPorts.length === 0;  // 0b000000: 수신 없어야 함
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 200));
-        const data = await api('/api/capture/packets?limit=1000');
-        const pkts = data.rows || [];
-        const hits = macFilter
-          ? pkts.filter(r => (r.frameHex || '').toLowerCase().includes(macFilter)
-              || JSON.stringify(r.decoded || {}).toLowerCase().includes(macFilter))
-          : pkts;
-        matched = hits.length;
-        if (matched >= captureExpected) break;
+        const fetches = [api('/api/capture/packets?limit=1000')];
+        for (const url of allNodeBUrls)
+          fetches.push(fetch(`${url}/api/capture/packets?limit=1000`, { signal: AbortSignal.timeout(3000) }).then(r => r.json()).catch(() => ({ rows: [] })));
+        const results = await Promise.all(fetches);
+        for (const data of results) {
+          for (const pkt of (data.rows || [])) {
+            if (pkt.direction === 'TX') continue;
+            const entry = state.portmap.find(e => e.iface === pkt.interface);
+            if (entry !== undefined) receivedPorts.add(Number(entry.port));
+          }
+        }
+        // 수신이 있어야 하는 경우: 기대 포트 모두 수신 확인 시 break
+        // 수신이 없어야 하는 경우: 타임아웃까지 전체 대기 (중간에 수신 감지되면 즉시 fail)
+        if (!expectNone && expectedPorts.every(p => receivedPorts.has(p))) break;
+        if (expectNone && receivedPorts.size > 0) break;  // 수신 감지 → 즉시 fail 확정
       }
-      await api('/api/capture/stop', { method: 'POST', body: '{}' });
 
-      return matched >= captureExpected
-        ? { ok: true,  detail: `${matched}/${captureExpected} frames captured` }
-        : { ok: false, error: `RxVerify: only ${matched}/${captureExpected} frames in ${timeoutMs}ms` };
+      const stopPs = [api('/api/capture/stop', { method: 'POST', body: '{}' })];
+      for (const url of allNodeBUrls)
+        stopPs.push(fetch(`${url}/api/capture/stop`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
+      await Promise.all(stopPs);
+
+      const gotBitmap   = [...receivedPorts].reduce((acc, p) => acc | (1 << p), 0);
+      const rawStr = String(row['Expected'] || row['expected'] || '0');
+      const origLen = rawStr.startsWith('0b') || rawStr.startsWith('0B')
+        ? rawStr.length - 2 : Math.max(expectedBitmap.toString(2).length, gotBitmap.toString(2).length);
+      const padLen = Math.max(origLen, gotBitmap.toString(2).length);
+      const allReceived = gotBitmap === expectedBitmap;
+      return allReceived
+        ? { ok: true,  detail: `received 0b${gotBitmap.toString(2).padStart(padLen, '0')}` }
+        : { ok: false, error:  `expected 0b${expectedBitmap.toString(2).padStart(padLen,'0')}, got 0b${gotBitmap.toString(2).padStart(padLen,'0')} in ${timeoutMs}ms` };
     } catch (e) { return { ok: false, error: `RxVerify error: ${e.message}` }; }
+  }
+
+  // ── RxCapture — 수신 결과만 캡처, 검증 없이 lastResult에 저장 ─────────────────
+  if (evType === 'rxcapture') {
+    const timeoutMs = parseInt(row['Timeout'] || row['timeout'] || '1000') || 1000;
+
+    const allNodeBUrls = [...new Set(
+      state.portmap.filter(e => e.nodeUrl).map(e => e.nodeUrl)
+    )];
+    const allLocalIfaces = state.portmap.filter(e => !e.nodeUrl && e.iface).map(e => e.iface);
+    const allNodeBIfaceMap = new Map();
+    for (const e of state.portmap.filter(e => e.nodeUrl && e.iface)) {
+      const list = allNodeBIfaceMap.get(e.nodeUrl) || [];
+      list.push(e.iface);
+      allNodeBIfaceMap.set(e.nodeUrl, list);
+    }
+
+    if (!allLocalIfaces.length && !allNodeBIfaceMap.size)
+      return { ok: false, error: 'RxCapture: portmap 인터페이스 없음 — Settings 확인' };
+
+    try {
+      if (!ctx.capturePrestarted) {
+        const clearPs = [api('/api/capture/clear', { method: 'POST', body: '{}' })];
+        for (const url of allNodeBUrls)
+          clearPs.push(fetch(`${url}/api/capture/clear`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
+        await Promise.all(clearPs);
+
+        const startPs = [];
+        if (allLocalIfaces.length)
+          startPs.push(api('/api/capture/start', { method: 'POST', body: JSON.stringify({ interfaces: allLocalIfaces, promisc: true }) }));
+        for (const [url, ifaces] of allNodeBIfaceMap)
+          startPs.push(fetch(`${url}/api/capture/start`, { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ interfaces: ifaces, promisc: true }) }).catch(() => {}));
+        await Promise.all(startPs);
+      }
+
+      await new Promise(r => setTimeout(r, timeoutMs));
+
+      const stopPs = [api('/api/capture/stop', { method: 'POST', body: '{}' })];
+      for (const url of allNodeBUrls)
+        stopPs.push(fetch(`${url}/api/capture/stop`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
+      await Promise.all(stopPs);
+
+      // 수신된 포트 비트맵 계산
+      const fetches = [api('/api/capture/packets?limit=1000')];
+      for (const url of allNodeBUrls)
+        fetches.push(fetch(`${url}/api/capture/packets?limit=1000`).then(r => r.json()).catch(() => ({ rows: [] })));
+      const results = await Promise.all(fetches);
+
+      const receivedPorts = new Set();
+      for (const data of results) {
+        for (const pkt of (data.rows || [])) {
+          if (pkt.direction === 'TX') continue;
+          const entry = state.portmap.find(e => e.iface === pkt.interface);
+          if (entry !== undefined) receivedPorts.add(Number(entry.port));
+        }
+      }
+
+      const gotBitmap = [...receivedPorts].reduce((acc, p) => acc | (1 << p), 0);
+      const bitmapStr = `0b${gotBitmap.toString(2).padStart(state.portmap.length || 6, '0')}`;
+      return {
+        ok: true,
+        detail: `received ${bitmapStr}`,
+        values: { received: bitmapStr },
+      };
+    } catch (e) { return { ok: false, error: `RxCapture error: ${e.message}` }; }
+  }
+
+  // ── Break ─────────────────────────────────────────────────────────────────────
+  if (evType === 'break') {
+    return { ok: true, _break: true, detail: 'break' };
+  }
+
+  // ── BranchTo ──────────────────────────────────────────────────────────────────
+  if (evType === 'branchto') {
+    const scenarioId = String(row['Test_Scenario_ID'] || row['Scenario_ID'] || '').trim();
+    const tcId       = String(row['TC_ID'] || row['tc_id'] || '').trim();
+    const prevResult = (ctx.lastResult || '').toLowerCase();
+
+    // "key:value" 쌍 파싱 (구분자: ',', 공백 허용)
+    function parseKV(s) {
+      const m = {};
+      s.split(',').forEach(pair => {
+        const idx = pair.indexOf(':');
+        if (idx > 0) m[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+      });
+      return m;
+    }
+
+    // ── Goto 모드: GotoIndex가 있으면 특정 위치로 점프 ──────────────────────────
+    const rawGotoIndex = row['GotoIndex'] || row['gotoIndex'] || row['gotoindex'] || '';
+    if (rawGotoIndex !== '' && rawGotoIndex !== '-') {
+      const gotoIndex      = parseInt(rawGotoIndex, 10) || 0;
+      const gotoScenarioId = String(row['GotoScenarioID'] || row['gotoScenarioId'] || scenarioId).trim();
+      const gotoTcId       = String(row['GotoTC_ID']      || row['gotoTcId']       || tcId).trim();
+      const gotoValue      = (row['GotoValue'] || row['gotoValue'] || '').trim().toLowerCase();
+      const maxIter        = parseInt(row['MaxIterations'] || row['maxIterations'] || '10', 10) || 10;
+
+      // 반복 횟수 추적 (ctx.gotoIterations: Map<key, count>)
+      const gotoIterations = ctx.gotoIterations || new Map();
+      const iterKey = `${gotoScenarioId}:${gotoTcId}:${gotoIndex}:${gotoValue}`;
+      const iterCount = (gotoIterations.get(iterKey) || 0) + 1;
+      if (iterCount > maxIter) {
+        return { ok: false, error: `BranchTo: MaxIterations(${maxIter}) 초과 (${iterKey})` };
+      }
+      gotoIterations.set(iterKey, iterCount);
+
+      // TC_Branch.csv 로드
+      let gotoAllRows;
+      try {
+        const res = await api('/api/testcases/branch-rows', {
+          method: 'POST',
+          // GotoValue를 GroupID로 서버에 전달 → 서버에서 직접 필터링
+          body: JSON.stringify({ scenarioId: gotoScenarioId, tcId: gotoTcId, groupId: gotoValue || undefined }),
+        });
+        if (!res.ok) throw new Error(res.error || 'goto load failed');
+        gotoAllRows = res.rows || [];
+      } catch (e) {
+        return { ok: false, error: `BranchTo goto 로드 실패: ${e.message}` };
+      }
+
+      // GotoIndex 이상 필터 (GroupID 필터는 서버에서 처리)
+      const gotoRows = gotoAllRows.filter(r => {
+        const idx = parseInt(r['Index'] || r['index'] || '0', 10) || 0;
+        return idx >= gotoIndex;
+      });
+
+      if (!gotoRows.length) {
+        const why = `goto 대상 없음 (scenario=${gotoScenarioId}, TC=${gotoTcId}, GroupID="${gotoValue}", index≥${gotoIndex})`;
+        appendSeqTerm(`    ⤳ BranchTo skip: ${why}`);
+        return { ok: true, detail: `goto skipped — ${why}` };
+      }
+
+      return await _executeBranchRows(gotoRows, { label: `goto(${iterKey})`, gotoIterations });
+    }
+
+    // TC_Branch.csv에서 scenarioId + tcId 행 로드
+    let branchRows;
+    try {
+      const res = await api('/api/testcases/branch-rows', {
+        method: 'POST',
+        body: JSON.stringify({ scenarioId, tcId }),
+      });
+      if (!res.ok) throw new Error(res.error || 'branch load failed');
+      branchRows = res.rows || [];
+    } catch (e) {
+      return { ok: false, error: `TC_Branch.csv 로드 실패: ${e.message}` };
+    }
+
+    // Value 컬럼이 lastResult와 일치하는 행 그룹 찾기 (부분 key:value 매칭)
+    const gotKV = parseKV(prevResult);
+    const matchedGroups = new Set();
+    branchRows.forEach(r => {
+      const val = String(r['Value'] || r['value'] || '').trim().toLowerCase();
+      if (!val) return;
+      const wantKV = parseKV(val);
+      const allMatch = Object.entries(wantKV).every(([k, v]) => gotKV[k] === v);
+      if (allMatch) matchedGroups.add(val);
+    });
+
+    if (matchedGroups.size === 0) {
+      const availVals = [...new Set(branchRows.map(r => String(r['Value'] || r['value'] || '').trim()).filter(Boolean))];
+      const why = branchRows.length === 0
+        ? `TC_Branch.csv에 scenario=${scenarioId}, TC=${tcId} 행 없음`
+        : `prevResult="${prevResult}" 와 일치하는 Value 없음 (있는 값: ${availVals.join(' | ') || '없음'})`;
+      appendSeqTerm(`    ⤳ BranchTo skip: ${why}`);
+      return { ok: true, detail: `branch skipped — ${why}` };
+    }
+
+    // 일치하는 Value 행들만 추출 (Index 순)
+    const matchedRows = branchRows.filter(r => {
+      const val = String(r['Value'] || r['value'] || '').trim().toLowerCase();
+      return matchedGroups.has(val);
+    });
+
+    const matchedVal = [...matchedGroups].join(', ');
+    return await _executeBranchRows(matchedRows, { label: `branch "${matchedVal}"` });
+
+    // ── 공통 sub-rows 실행 헬퍼 ────────────────────────────────────────────────
+    async function _executeBranchRows(rows, { label = 'branch', gotoIterations } = {}) {
+      const tbody      = document.getElementById('sequenceRows');
+      // 실제 행 인덱스(ctx.rowIdx)는 분기 sub-row를 제외한 기준이므로 동일하게 제외
+      const allTrs     = tbody ? [...tbody.querySelectorAll('tr:not(.branch-sub-row)')] : [];
+      const branchTr   = ctx.anchorTr || allTrs[ctx.rowIdx];
+      const branchDepth = (ctx.branchDepth || 0) + 1;
+      const branchNonce = `${branchDepth}-${Date.now()}`;
+      const logPad = '  '.repeat(branchDepth + 1);
+
+      appendSeqTerm(`${logPad}↳ ${label}: ${rows.length} branch step${rows.length === 1 ? '' : 's'}`);
+
+      // TR 삽입
+      const subTrs = [];
+      let anchor = branchTr;
+      for (let i = 0; i < rows.length; i++) {
+        const tr = document.createElement('tr');
+        tr.className = 'branch-sub-row';
+        tr.dataset.branchDepth = branchDepth;
+        const indent   = 20 * branchDepth;
+        const name     = rows[i]['Name']      || rows[i]['name']      || `Branch Step ${i}`;
+        const evName   = rows[i]['EventType'] || rows[i]['Event Type'] || '';
+        const resultId = `branch-result-${branchNonce}-${i}`;
+        tr.innerHTML =
+          `<td></td>` +
+          `<td style="padding-left:${indent}px;color:var(--muted);">${'↳'.repeat(branchDepth)} ${i}</td>` +
+          `<td style="color:var(--muted);">${name}</td>` +
+          `<td style="color:var(--muted);">${evName}</td>` +
+          `<td colspan="3"></td>` +
+          `<td id="${resultId}" style="font-size:11px;"></td>`;
+        if (anchor && anchor.parentNode)
+          anchor.parentNode.insertBefore(tr, anchor.nextSibling);
+        subTrs.push(tr);
+        anchor = tr;
+      }
+
+      // 순서대로 실행
+      let allOk = true;
+      let subLastResult = prevResult;
+      for (let i = 0; i < rows.length; i++) {
+        const subRow   = rows[i];
+        const resultId = `branch-result-${branchNonce}-${i}`;
+        const resultEl = document.getElementById(resultId);
+        if (resultEl) { resultEl.textContent = '…'; resultEl.style.color = 'var(--muted)'; }
+
+        let subRes;
+        try {
+          subRes = await executeEvent(subRow, iface, {
+            ...ctx,
+            rowIdx:          -1,
+            lastResult:      subLastResult,
+            anchorTr:        subTrs[i],
+            branchDepth,
+            gotoIterations:  gotoIterations || ctx.gotoIterations,
+          });
+        } catch (e) {
+          subRes = { ok: false, error: e.message };
+        }
+
+        // lastResult 갱신
+        if (!subRes.ok) {
+          subLastResult = 'result:fail';
+        } else if (subRes.values) {
+          subLastResult = Object.entries(subRes.values).map(([k, v]) => `${k}:${v}`).join(', ');
+        } else {
+          subLastResult = 'result:pass';
+        }
+
+        if (resultEl) {
+          resultEl.textContent = subRes.ok ? (subRes._break ? 'Break' : 'Done') : 'Fail';
+          resultEl.style.color = subRes.ok ? 'var(--green)' : 'var(--red)';
+          resultEl.title       = subRes.ok ? (subRes.detail || '') : (subRes.error || '');
+        }
+
+        const subName = subRow['Name'] || subRow['name'] || `step ${i}`;
+        const subEv   = subRow['EventType'] || subRow['Event Type'] || '';
+        appendSeqTerm(`${logPad}  ${subRes.ok ? '✓' : '✗'} [${subEv}] ${subName}: ${subRes.ok ? (subRes.detail || 'OK') : subRes.error}`);
+
+        // Break 신호: 현재 분기 종료, 바깥으로 정상 반환
+        if (subRes._break) break;
+        if (!subRes.ok) { allOk = false; break; }
+      }
+
+      return allOk
+        ? { ok: true,  detail: `${label} OK (${rows.length} steps)` }
+        : { ok: false, error:  `${label} failed` };
+    }
   }
 
   // unknown event type
@@ -3369,7 +3930,8 @@ function setRowResult(rowIdx, result, detail) {
   rows[rowIdx]._resultDetail = detail || '';
   const tbody = $('sequenceRows');
   if (!tbody) return;
-  const trs = tbody.querySelectorAll('tr');
+  // 분기 sub-row는 실제 행 인덱스에 포함되지 않으므로 제외하고 센다
+  const trs = tbody.querySelectorAll('tr:not(.branch-sub-row)');
   if (!trs[rowIdx]) return;
   const tds    = trs[rowIdx].querySelectorAll('td');
   const lastTd = tds[tds.length - 1];
@@ -3402,21 +3964,117 @@ async function runSeqSequence() {
     for (const row of (tc.rows || [])) { row._result = ''; row._resultDetail = ''; }
     renderCsvSequence(tc.rows || []);
 
+    // 이전 실행에서 삽입된 branch sub-rows 제거
+    const _seqTbody = document.getElementById('sequenceRows');
+    if (_seqTbody) _seqTbody.querySelectorAll('tr.branch-sub-row').forEach(tr => tr.remove());
+
     let tcOk = true;
-    for (let j = 0; j < (tc.rows || []).length; j++) {
+    let nextCapturePrestarted_seq = false;
+    let lastResult_seq = '';
+    const rows = tc.rows || [];
+    for (let j = 0; j < rows.length; j++) {
       if (state._runAbort) break;
-      const row = tc.rows[j];
+      const row = rows[j];
       const ev  = (row['EventType'] || row['Event Type'] || '').toLowerCase();
+
+      // ── 연속 Packet 스텝 병렬 처리 ──────────────────────────────────────────
+      if (ev === 'packet') {
+        // 연속된 Packet 스텝 묶음 수집
+        const pktGroup = [];
+        let k = j;
+        while (k < rows.length) {
+          const kEv = (rows[k]['EventType'] || rows[k]['Event Type'] || '').toLowerCase();
+          if (kEv !== 'packet') break;
+          pktGroup.push({ idx: k, row: rows[k] });
+          k++;
+        }
+
+        // 묶음 다음 스텝이 RxVerify/RxCapture면 캡처 미리 시작
+        const afterEv = k < rows.length
+          ? (rows[k]['EventType'] || rows[k]['Event Type'] || '').toLowerCase()
+          : '';
+        if (afterEv === 'rxverify' || afterEv === 'rxcapture') {
+          if (await _maybePreStartCapture(rows, k - 1)) nextCapturePrestarted_seq = true;
+        }
+
+        // UI: 묶음 전체 '…' 표시
+        for (const { idx } of pktGroup) setRowResult(idx, '…', '');
+
+        // 인터페이스별 그룹화 → 같은 인터페이스 순차, 다른 인터페이스 병렬
+        const ifaceGroups = new Map();
+        for (const item of pktGroup) {
+          const pktIface = item.row['Interface'] || item.row['interface'] || iface || '';
+          if (!ifaceGroups.has(pktIface)) ifaceGroups.set(pktIface, []);
+          ifaceGroups.get(pktIface).push(item);
+        }
+
+        const capturePrestarted = nextCapturePrestarted_seq;
+        nextCapturePrestarted_seq = false;
+
+        // 각 인터페이스 그룹을 병렬 실행
+        const groupResults = await Promise.all(
+          [...ifaceGroups.values()].map(async group => {
+            const results = [];
+            for (const { idx, row: pRow } of group) {
+              let res;
+              try {
+                res = await executeEvent(pRow, iface, { capturePrestarted, rowIdx: idx, lastResult: lastResult_seq });
+              } catch (err) {
+                res = { ok: false, error: err.message };
+              }
+              results.push({ idx, res });
+            }
+            return results;
+          })
+        );
+
+        // 결과 처리 (원래 순서로 UI 업데이트)
+        const allResults = groupResults.flat().sort((a, b) => a.idx - b.idx);
+        let groupOk = true;
+        for (const { idx, res } of allResults) {
+          const evName = (rows[idx]['EventType'] || '').toLowerCase();
+          const resultStr = res.ok ? 'Done' : 'Fail';
+          setRowResult(idx, resultStr, res.ok ? (res.detail || '') : (res.error || ''));
+          appendSeqTerm(`    ${res.ok ? '✓' : '✗'} ${evName}: ${res.ok ? (res.detail || 'OK') : res.error}`);
+          if (!res.ok) groupOk = false;
+        }
+
+        lastResult_seq = groupOk ? 'result:pass' : 'result:fail';
+        if (!groupOk) { tcOk = false; if (!failIgnore) break; }
+
+        // 묶음 크기만큼 인덱스 skip
+        j = k - 1;
+        continue;
+      }
+
+      // ── 일반 스텝 처리 ──────────────────────────────────────────────────────
       setRowResult(j, '…', '');
+      const capturePrestarted = nextCapturePrestarted_seq;
+      nextCapturePrestarted_seq = false;
       let res;
       try {
-        const capturePrestarted = await _maybePreStartCapture(tc.rows, j);
-        res = await executeEvent(row, iface, { capturePrestarted });
+        if (await _maybePreStartCapture(rows, j)) nextCapturePrestarted_seq = true;
+        res = await executeEvent(row, iface, { capturePrestarted, rowIdx: j, lastResult: lastResult_seq });
       }
       catch (err) { res = { ok: false, error: err.message }; }
+      // Break: 현재 TC의 남은 스텝을 중단하고 다음 TC로 (실패 아님)
+      if (res._break) {
+        setRowResult(j, 'Break', res.detail || 'break');
+        appendSeqTerm(`    ■ break — TC 중단`);
+        break;
+      }
       const resultStr = res.ok ? 'Done' : 'Fail';
+      if (!res.ok) {
+        lastResult_seq = 'result:fail';
+      } else if (res.values) {
+        lastResult_seq = Object.entries(res.values).map(([k, v]) => `${k}:${v}`).join(', ');
+      } else {
+        lastResult_seq = 'result:pass';
+      }
       setRowResult(j, resultStr, res.ok ? (res.detail || '') : (res.error || ''));
-      appendSeqTerm(`    ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
+      // BranchTo는 헤더+하위 스텝을 스스로 로깅하므로 중복 결과 줄을 생략
+      if (ev !== 'branchto')
+        appendSeqTerm(`    ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
       if (!res.ok) {
         tcOk = false;
         if (!failIgnore) break;
@@ -3457,6 +4115,8 @@ async function scenarioSendSelected() {
   if (statsEl) statsEl.textContent = `S: ${t0.toLocaleTimeString()} | E: —`;
   appendSeqTerm(`▶ Send Selected (${checkedIdxs.length} rows)…`);
 
+  let nextCapturePrestarted_sel = false;
+  let lastResult_sel = '';
   for (let ci = 0; ci < checkedIdxs.length; ci++) {
     if (state._runAbort) break;
     const idx  = checkedIdxs[ci];
@@ -3464,17 +4124,29 @@ async function scenarioSendSelected() {
     const row  = rows[idx];
     const ev   = (row['EventType'] || row['Event Type'] || '').toLowerCase();
     setRowResult(idx, '…', '');
+    const capturePrestarted = nextCapturePrestarted_sel;
+    nextCapturePrestarted_sel = false;
     let res;
     try {
       // Build a virtual adjacent-row pair so look-ahead works on sparse selections
       const pairRows = nextIdx >= 0 ? [rows[idx], rows[nextIdx]] : [rows[idx]];
-      const capturePrestarted = await _maybePreStartCapture(pairRows, 0);
-      res = await executeEvent(row, iface, { capturePrestarted });
+      if (await _maybePreStartCapture(pairRows, 0)) nextCapturePrestarted_sel = true;
+      res = await executeEvent(row, iface, { capturePrestarted, rowIdx: idx, lastResult: lastResult_sel });
     }
     catch (err) { res = { ok: false, error: err.message }; }
+    // Break: 남은 스텝 실행 중단
+    if (res._break) {
+      setRowResult(idx, 'Break', res.detail || 'break');
+      appendSeqTerm(`  ■ break — 중단`);
+      break;
+    }
+    if (!res.ok) lastResult_sel = 'result:fail';
+    else if (res.values) lastResult_sel = Object.entries(res.values).map(([k, v]) => `${k}:${v}`).join(', ');
+    else lastResult_sel = 'result:pass';
     const resultStr = res.ok ? 'Done' : 'Fail';
     setRowResult(idx, resultStr, res.ok ? (res.detail || '') : (res.error || ''));
-    appendSeqTerm(`  ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
+    if (ev !== 'branchto')
+      appendSeqTerm(`  ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
     if (!res.ok && !failIgnore) { toast(`Fail: ${ev} — ${res.error}`, 'bad'); break; }
   }
 
@@ -3502,20 +4174,34 @@ async function scenarioSendList() {
   if (statsEl) statsEl.textContent = `S: ${t0.toLocaleTimeString()} | E: —`;
   appendSeqTerm(`▶ Send List (${rows.length} rows)…`);
 
+  let nextCapturePrestarted_list = false;
+  let lastResult_list = '';
   for (let i = 0; i < rows.length; i++) {
     if (state._runAbort) break;
     const row = rows[i];
     const ev  = (row['EventType'] || row['Event Type'] || '').toLowerCase();
     setRowResult(i, '…', '');
+    const capturePrestarted = nextCapturePrestarted_list;
+    nextCapturePrestarted_list = false;
     let res;
     try {
-      const capturePrestarted = await _maybePreStartCapture(rows, i);
-      res = await executeEvent(row, iface, { capturePrestarted });
+      if (await _maybePreStartCapture(rows, i)) nextCapturePrestarted_list = true;
+      res = await executeEvent(row, iface, { capturePrestarted, rowIdx: i, lastResult: lastResult_list });
     }
     catch (err) { res = { ok: false, error: err.message }; }
+    // Break: 남은 스텝 실행 중단
+    if (res._break) {
+      setRowResult(i, 'Break', res.detail || 'break');
+      appendSeqTerm(`  ■ break — 중단`);
+      break;
+    }
+    if (!res.ok) lastResult_list = 'result:fail';
+    else if (res.values) lastResult_list = Object.entries(res.values).map(([k, v]) => `${k}:${v}`).join(', ');
+    else lastResult_list = 'result:pass';
     const resultStr = res.ok ? 'Done' : 'Fail';
     setRowResult(i, resultStr, res.ok ? (res.detail || '') : (res.error || ''));
-    appendSeqTerm(`  ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
+    if (ev !== 'branchto')
+      appendSeqTerm(`  ${res.ok ? '✓' : '✗'} ${ev}: ${res.ok ? (res.detail || 'OK') : res.error}`);
     if (!res.ok && !failIgnore) { toast(`Fail: ${ev} — ${res.error}`, 'bad'); break; }
   }
 
@@ -3534,13 +4220,35 @@ async function _maybePreStartCapture(rows, currentIdx) {
   if (!cur || !next) return false;
   const curEv  = (cur['EventType']  || cur['Event Type']  || '').toLowerCase().trim();
   const nextEv = (next['EventType'] || next['Event Type'] || '').toLowerCase().trim();
-  if (curEv !== 'packet' || nextEv !== 'rxverify') return false;
-  const captureIface = next['CaptureInterface'] || next['captureInterface'] || next['Interface'] || '';
-  const ifaces = captureIface ? [captureIface] : [];
+  if (curEv !== 'packet' || (nextEv !== 'rxverify' && nextEv !== 'rxcapture')) return false;
+
+  // portmap 전체 인터페이스 캡처 (수신된 포트를 빠짐없이 확인)
+  const localIfaces = [], nodeBIfaceMap = new Map();
+  for (const entry of state.portmap) {
+    if (!entry?.iface) continue;
+    if (entry.nodeUrl) {
+      const list = nodeBIfaceMap.get(entry.nodeUrl) || [];
+      list.push(entry.iface);
+      nodeBIfaceMap.set(entry.nodeUrl, list);
+    } else {
+      localIfaces.push(entry.iface);
+    }
+  }
+
   try {
-    await api('/api/capture/clear', { method: 'POST', body: '{}' });
-    await api('/api/capture/start', { method: 'POST', body: JSON.stringify({ interfaces: ifaces }) });
-  } catch { /* ignore — rxverify will restart on its own */ return false; }
+    const clearPs = [api('/api/capture/clear', { method: 'POST', body: '{}' })];
+    for (const [url] of nodeBIfaceMap)
+      clearPs.push(fetch(`${url}/api/capture/clear`, { method: 'POST', headers: {'content-type':'application/json'}, body: '{}' }).catch(() => {}));
+    await Promise.all(clearPs);
+
+    const startPs = [];
+    if (localIfaces.length)
+      startPs.push(api('/api/capture/start', { method: 'POST', body: JSON.stringify({ interfaces: localIfaces, promisc: true }) }));
+    for (const [url, ifaces] of nodeBIfaceMap)
+      startPs.push(fetch(`${url}/api/capture/start`, { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ interfaces: ifaces, promisc: true }) }).catch(() => {}));
+    await Promise.all(startPs);
+  } catch { return false; }
+  // 항상 true 반환 → RxVerify가 자체 capture/clear 호출 안 함 (TX 프레임 보존)
   return true;
 }
 
@@ -3677,16 +4385,6 @@ async function fdbPoll(off, mask, timeoutMs) {
   throw new Error(`Poll timeout off=0x${off.toString(16)}`);
 }
 
-function fdbEncodeMac(mac) {
-  const b = mac.split(':').map(s => parseInt(s, 16));
-  return { mac0: ((b[2]<<24)|(b[3]<<16)|(b[4]<<8)|b[5])>>>0, mac1: ((b[0]<<8)|b[1])>>>0 };
-}
-
-function fdbDecodeMac(hi16, mid16, lo16) {
-  return [(hi16>>8)&0xFF,hi16&0xFF,(mid16>>8)&0xFF,mid16&0xFF,(lo16>>8)&0xFF,lo16&0xFF]
-    .map(b => b.toString(16).toUpperCase().padStart(2,'0')).join(':');
-}
-
 function fdbInputs() {
   const mac    = $('rv-fdb-mac')?.value.trim() || '00:00:00:00:00:00';
   const vlanId = parseInt($('rv-fdb-vlan')?.value || '0') & 0xFFF;
@@ -3711,71 +4409,103 @@ function fdbClearRows() {
   if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No results yet</td></tr>';
 }
 
+function fdbSession() { return $('serialPort')?.value || ''; }
+
 async function fdbReadByHash() {
   const { mac, vlanId, vlanV } = fdbInputs();
   setRegStatus('rv-st-fdb-cmd', 'Reading...', false);
   try {
-    const { mac0, mac1 } = fdbEncodeMac(mac);
-    await fdbWr(FDB_OFF.MCU_MAC0, mac0); await fdbWr(FDB_OFF.MCU_MAC1, mac1);
-    await fdbWr(FDB_OFF.MCU_VLAN, (vlanV?0x1000:0)|vlanId);
-    await fdbWr(FDB_OFF.MCU_CMD, FDB_CMD.HASH_READ);
-    await fdbPoll(FDB_OFF.CMD_STATUS, 0x1, 500);
-    const flags = await fdbReg(FDB_OFF.RD_FLAGS);
+    const res = await api('/api/fdb/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession(), mac, vlanId, vlanValid: vlanV })
+    });
+    if (!res.ok) throw new Error(res.error || 'read failed');
     fdbClearRows();
-    if ((flags & 0x8000) === 0) { fdbAddRow({mac,port:'-',bucket:'-',slot:'-',ts:'-',status:'Not found'}); setRegStatus('rv-st-fdb-cmd','Not learned',false); }
-    else {
-      const rdPort=await fdbReg(FDB_OFF.RD_PORT), rdBucket=await fdbReg(FDB_OFF.RD_BUCKET);
-      fdbAddRow({mac,port:rdPort&0x1FF,bucket:rdBucket&0x3FF,slot:`0x${((rdBucket>>12)&0xF).toString(16)}`,ts:flags&0x3FFF,status:(flags&0x4000)?'Static':'Dynamic'});
-      setRegStatus('rv-st-fdb-cmd','Entry found',true);
+    const e = res.entry;
+    if (!e.found) {
+      fdbAddRow({ mac, port:'-', bucket:'-', slot:'-', ts:'-', status:'Not found' });
+      setRegStatus('rv-st-fdb-cmd', 'Not learned', false);
+    } else {
+      fdbAddRow({ mac: e.mac, port: e.port, bucket: e.bucket, slot: '-', ts: '-', status: e.static ? 'Static' : 'Dynamic' });
+      setRegStatus('rv-st-fdb-cmd', 'Entry found', true);
     }
-  } catch(err) { setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false); }
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbReadByBucket() {
   const { bucket, slot } = fdbInputs();
-  setRegStatus('rv-st-fdb-cmd','Reading...',false);
+  setRegStatus('rv-st-fdb-cmd', 'Reading...', false);
   try {
-    await fdbWr(FDB_OFF.MCU_BUCKET,((slot&0xF)<<16)|(bucket&0x3FF));
-    await fdbWr(FDB_OFF.MCU_CMD,FDB_CMD.READ_BUCKET);
-    await fdbPoll(FDB_OFF.CMD_STATUS,0x1,500);
-    const flags=await fdbReg(FDB_OFF.RD_FLAGS);
+    const res = await api('/api/fdb/read-bucket', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession(), bucket, slot })
+    });
+    if (!res.ok) throw new Error(res.error || 'read failed');
     fdbClearRows();
-    if((flags&0x8000)===0){fdbAddRow({bucket,slot:`0x${slot.toString(16)}`,mac:'-',port:'-',ts:'-',status:'Empty'});setRegStatus('rv-st-fdb-cmd','Slot empty',false);}
-    else{
-      const mac0=await fdbReg(FDB_OFF.RD_MAC0),mac1=await fdbReg(FDB_OFF.RD_MAC1),mac2=await fdbReg(FDB_OFF.RD_MAC2),rdPort=await fdbReg(FDB_OFF.RD_PORT);
-      fdbAddRow({bucket,slot:`0x${slot.toString(16)}`,mac:fdbDecodeMac(mac2&0xFFFF,mac1&0xFFFF,mac0&0xFFFF),port:rdPort&0x1FF,ts:flags&0x3FFF,status:(flags&0x4000)?'Static':'Dynamic'});
-      setRegStatus('rv-st-fdb-cmd','Entry found',true);
+    const e = res.entry;
+    if (!e.found) {
+      fdbAddRow({ bucket, slot: `0x${slot.toString(16)}`, mac:'-', port:'-', ts:'-', status:'Empty' });
+      setRegStatus('rv-st-fdb-cmd', 'Slot empty', false);
+    } else {
+      fdbAddRow({ bucket: e.bucket, slot: `0x${(e.slot||slot).toString(16)}`, mac: e.mac, port: e.port, ts:'-', status: e.static ? 'Static' : 'Dynamic' });
+      setRegStatus('rv-st-fdb-cmd', 'Entry found', true);
     }
-  } catch(err){setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false);}
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbWriteByHash() {
-  const{mac,vlanId,vlanV,port}=fdbInputs();
-  setRegStatus('rv-st-fdb-cmd','Writing...',false);
-  try{const{mac0,mac1}=fdbEncodeMac(mac);await fdbWr(FDB_OFF.MCU_MAC0,mac0);await fdbWr(FDB_OFF.MCU_MAC1,mac1);await fdbWr(FDB_OFF.MCU_VLAN,(vlanV?0x1000:0)|vlanId);await fdbWr(FDB_OFF.MCU_PORT,port);await fdbWr(FDB_OFF.MCU_CMD,FDB_CMD.HASH_WRITE);await fdbPoll(FDB_OFF.CMD_STATUS,0x4,500);setRegStatus('rv-st-fdb-cmd','Write OK',true);}
-  catch(err){setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false);}
+  const { mac, vlanId, vlanV, port } = fdbInputs();
+  setRegStatus('rv-st-fdb-cmd', 'Writing...', false);
+  try {
+    const res = await api('/api/fdb/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession(), mac, vlanId, vlanValid: vlanV, port })
+    });
+    if (!res.ok) throw new Error(res.error || 'write failed');
+    setRegStatus('rv-st-fdb-cmd', 'Write OK', true);
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbWriteByBucket() {
-  const{mac,vlanId,vlanV,port,bucket,slot}=fdbInputs();
-  setRegStatus('rv-st-fdb-cmd','Writing...',false);
-  try{const{mac0,mac1}=fdbEncodeMac(mac);await fdbWr(FDB_OFF.MCU_MAC0,mac0);await fdbWr(FDB_OFF.MCU_MAC1,mac1);await fdbWr(FDB_OFF.MCU_VLAN,(vlanV?0x1000:0)|vlanId);await fdbWr(FDB_OFF.MCU_PORT,port);await fdbWr(FDB_OFF.MCU_BUCKET,((slot&0xF)<<16)|(bucket&0x3FF));await fdbWr(FDB_OFF.MCU_CMD,FDB_CMD.WRITE_BUCKET);await fdbPoll(FDB_OFF.CMD_STATUS,0x4,500);setRegStatus('rv-st-fdb-cmd',`Write OK  Bkt:${bucket} Slot:0x${slot.toString(16)}`,true);}
-  catch(err){setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false);}
+  const { mac, vlanId, vlanV, port, bucket, slot } = fdbInputs();
+  setRegStatus('rv-st-fdb-cmd', 'Writing...', false);
+  try {
+    const res = await api('/api/fdb/write-bucket', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession(), mac, vlanId, vlanValid: vlanV, port, bucket, slot })
+    });
+    if (!res.ok) throw new Error(res.error || 'write failed');
+    setRegStatus('rv-st-fdb-cmd', `Write OK  Bkt:${res.bucket} Slot:0x${(res.slot||slot).toString(16)}`, true);
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbDeleteByHash() {
-  const{mac,vlanId,vlanV}=fdbInputs();
-  if(!confirm(`Delete FDB entry for ${mac}?`))return;
-  setRegStatus('rv-st-fdb-cmd','Deleting...',false);
-  try{const{mac0,mac1}=fdbEncodeMac(mac);await fdbWr(FDB_OFF.MCU_MAC0,mac0);await fdbWr(FDB_OFF.MCU_MAC1,mac1);await fdbWr(FDB_OFF.MCU_VLAN,(vlanV?0x1000:0)|vlanId);await fdbWr(FDB_OFF.MCU_CMD,FDB_CMD.HASH_DELETE);await fdbPoll(FDB_OFF.CMD_STATUS,0x4,500);fdbClearRows();setRegStatus('rv-st-fdb-cmd',`Deleted (${mac})`,true);}
-  catch(err){setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false);}
+  const { mac, vlanId, vlanV } = fdbInputs();
+  if (!confirm(`Delete FDB entry for ${mac}?`)) return;
+  setRegStatus('rv-st-fdb-cmd', 'Deleting...', false);
+  try {
+    const res = await api('/api/fdb/delete', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession(), mac, vlanId, vlanValid: vlanV })
+    });
+    if (!res.ok) throw new Error(res.error || 'delete failed');
+    fdbClearRows();
+    setRegStatus('rv-st-fdb-cmd', `Deleted (${mac})`, true);
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbInitAll() {
-  if(!confirm('Init all FDB tables?'))return;
-  setRegStatus('rv-st-fdb-cmd','Flushing...',false);
-  try{await fdbWr(FDB_OFF.MCU_CMD,FDB_CMD.FLUSH_ALL);await fdbPoll(FDB_OFF.FDB_STATUS,0x1,2000);fdbClearRows();setRegStatus('rv-st-fdb-cmd','Flush All done',true);}
-  catch(err){setRegStatus('rv-st-fdb-cmd',`Error: ${err.message}`,false);}
+  if (!confirm('Init all FDB tables?')) return;
+  setRegStatus('rv-st-fdb-cmd', 'Flushing...', false);
+  try {
+    const res = await api('/api/fdb/flush', {
+      method: 'POST',
+      body: JSON.stringify({ session: fdbSession() })
+    });
+    if (!res.ok) throw new Error(res.error || 'flush failed');
+    fdbClearRows();
+    setRegStatus('rv-st-fdb-cmd', 'Flush All done', true);
+  } catch(err) { setRegStatus('rv-st-fdb-cmd', `Error: ${err.message}`, false); }
 }
 
 async function fdbCtrlReadConfig() {
@@ -3783,22 +4513,36 @@ async function fdbCtrlReadConfig() {
   try{
     const ver=await fdbReg(FDB_OFF.VERSION);if($('rv-fdb-ver'))$('rv-fdb-ver').value=`0x${ver.toString(16).toUpperCase().padStart(8,'0')}`;
     const en=await fdbReg(FDB_OFF.ENABLE);if($('rv-fdb-age-scan'))$('rv-fdb-age-scan').checked=(en&(1<<4))!==0;if($('rv-fdb-learning'))$('rv-fdb-learning').checked=(en&(1<<1))!==0;if($('rv-fdb-lookup'))$('rv-fdb-lookup').checked=(en&1)!==0;
-    const ap=await fdbReg(FDB_OFF.AGE_PERIOD),at=await fdbReg(FDB_OFF.AGING_THR);if($('rv-fdb-age-period'))$('rv-fdb-age-period').value=ap;if($('rv-fdb-aging-thr'))$('rv-fdb-aging-thr').value=at;
+    const ap=(await fdbReg(FDB_OFF.AGE_PERIOD))&0xFFFFFF;   // [23:0] 유효
+    const at=(await fdbReg(FDB_OFF.AGING_THR))&0xFFFF;      // [15:0] 유효
+    if($('rv-fdb-age-period'))$('rv-fdb-age-period').value=ap;
+    if($('rv-fdb-aging-thr'))$('rv-fdb-aging-thr').value=at;
     setRegStatus('rv-st-fdb-ctrl','Read OK',true);
   }catch(err){setRegStatus('rv-st-fdb-ctrl',`Error: ${err.message}`,false);}
 }
 
 async function fdbCtrlApplyEnable() {
-  let en=0;if($('rv-fdb-age-scan')?.checked)en|=(1<<4);if($('rv-fdb-learning')?.checked)en|=(1<<1);if($('rv-fdb-lookup')?.checked)en|=1;
   setRegStatus('rv-st-fdb-ctrl','Applying...',false);
-  try{await fdbWr(FDB_OFF.ENABLE,en);setRegStatus('rv-st-fdb-ctrl','ENABLE applied',true);}
-  catch(err){setRegStatus('rv-st-fdb-ctrl',`Error: ${err.message}`,false);}
+  try {
+    let en=0;if($('rv-fdb-age-scan')?.checked)en|=(1<<4);if($('rv-fdb-learning')?.checked)en|=(1<<1);if($('rv-fdb-lookup')?.checked)en|=1;
+    const ap = (parseInt($('rv-fdb-age-period')?.value||'0')||0) & 0xFFFFFF;  // [23:0]
+    const at = (parseInt($('rv-fdb-aging-thr')?.value||'0')||0) & 0xFFFF;    // [15:0]
+    await fdbWr(FDB_OFF.ENABLE, en);
+    await fdbWr(FDB_OFF.AGE_PERIOD, ap);
+    await fdbWr(FDB_OFF.AGING_THR, at);
+    setRegStatus('rv-st-fdb-ctrl','Applied',true);
+  } catch(err){setRegStatus('rv-st-fdb-ctrl',`Error: ${err.message}`,false);}
 }
 
 async function fdbCtrlLoadDefault() {
   setRegStatus('rv-st-fdb-ctrl','Loading...',false);
-  try{await fdbWr(FDB_OFF.FDB_LOAD,1);setRegStatus('rv-st-fdb-ctrl','Default Load OK',true);}
-  catch(err){setRegStatus('rv-st-fdb-ctrl',`Error: ${err.message}`,false);}
+  try {
+    await fdbWr(FDB_OFF.ENABLE,     0x01);     // Lookup Enable
+    await fdbWr(FDB_OFF.AGE_PERIOD, 0xF4240);  // 1,000,000 ns
+    await fdbWr(FDB_OFF.AGING_THR,  0xBB8);    // 3,000
+    await fdbCtrlReadConfig();
+    setRegStatus('rv-st-fdb-ctrl','Default Load OK',true);
+  } catch(err) { setRegStatus('rv-st-fdb-ctrl',`Error: ${err.message}`,false); }
 }
 
 // ── INTERRUPT ─────────────────────────────────────────────────────────────────
@@ -3985,25 +4729,27 @@ async function clkRead() {
 
 async function clkApply(offset,inputId){const mhz=parseFloat($(inputId)?.value||'0');await rvWrite(offset,`0x${clkMhzToLimit(mhz).toString(16).padStart(8,'0')}`,'rv-st-clk-limit');}
 
-// ── COUNT ─────────────────────────────────────────────────────────────────────
-async function countRead() {
-  const port=$('rv-count-port')?.value||'all';
-  setRegStatus('rv-st-count','Reading...',true);
-  try{
-    const data=await api(`/api/counter/read?port=${encodeURIComponent(port)}`);
-    const tbody=$('rv-count-tbody');if(!tbody)return;
-    if(!data.counters||data.counters.length===0){tbody.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--muted);">No data — check serial connection</td></tr>';setRegStatus('rv-st-count','No data',false);return;}
-    tbody.innerHTML=data.counters.map(c=>`<tr><td>${esc(c.name)}</td><td class="mono" style="font-size:11px;">${esc(c.address)}</td><td class="mono" style="font-size:11px;">${esc(c.value)}</td><td style="text-align:right;">${c.valueDec}</td></tr>`).join('');
-    setRegStatus('rv-st-count',`${data.counters.length} counters  port: ${port==='all'?'ALL':`Port ${port}`}`,true);
-  }catch(err){setRegStatus('rv-st-count',`Error: ${err.message}`,false);}
-}
-
 // ── MDIO ──────────────────────────────────────────────────────────────────────
 const MDIO_PHY_ADDRS=[0x00,0x04,0x05,0x08,0x0A,0x0C];
+
+// Per-port setup cache populated by mdioReadAllLink(); null = not yet read
+let _mdioSetupsCache = null;
+
+function _applyMdioSetupToUI(setup) {
+  if (!setup) return;
+  if ($('rv-mdio-en'))    $('rv-mdio-en').checked     = setup.enable     ?? false;
+  if ($('rv-mdio-predis'))$('rv-mdio-predis').checked = setup.preDisable ?? false;
+  if ($('rv-mdio-intr'))  $('rv-mdio-intr').checked   = setup.intrEnable ?? false;
+  if ($('rv-mdio-clk'))   $('rv-mdio-clk').value      = String(setup.clk  ?? 20);
+  if ($('rv-mdio-ms'))    $('rv-mdio-ms').value        = String(setup.ms   ?? 2500);
+  if ($('rv-mdio-unit'))  $('rv-mdio-unit').value      = String(setup.unit ?? 100);
+  if ($('rv-mdio-mhz'))   $('rv-mdio-mhz').value       = String(setup.targetMhz ?? 2.5);
+}
 
 function mdioPortChanged() {
   const port=parseInt($('rv-mdio-port')?.value||'0'),phy=MDIO_PHY_ADDRS[port]??0;
   if($('rv-mdio-phy-addr'))$('rv-mdio-phy-addr').value=`0x${phy.toString(16).toUpperCase().padStart(2,'0')}`;
+  if (_mdioSetupsCache) _applyMdioSetupToUI(_mdioSetupsCache[port] ?? null);
 }
 
 function mdioCalcMdc() {
@@ -4011,6 +4757,31 @@ function mdioCalcMdc() {
   const ahbMhz=100.0,clk=Math.max(1,Math.min(255,Math.round(ahbMhz/(2.0*mhz)))),ms=Math.max(1,Math.min(4095,Math.round(mhz*1000.0)));
   if($('rv-mdio-clk'))$('rv-mdio-clk').value=String(clk);if($('rv-mdio-ms'))$('rv-mdio-ms').value=String(ms);if($('rv-mdio-unit'))$('rv-mdio-unit').value='100';
   setRegStatus('rv-st-mdio',`f_MDC ≈ ${(ahbMhz/(2.0*clk)).toFixed(3)} MHz  (CLK=${clk}, MILLISEC=${ms})`,true);
+}
+
+async function mdioReadSetup() {
+  const port = parseInt($('rv-mdio-port')?.value || '0');
+  const base = 0x0080 + port * 0x0040;
+  const setupOff = `0x${base.toString(16).toUpperCase().padStart(8, '0')}`;
+  const timeOff  = `0x${(base + 0x0004).toString(16).toUpperCase().padStart(8, '0')}`;
+  setRegStatus('rv-st-mdio', 'Reading...', true);
+  try {
+    const [sd, td] = await Promise.all([
+      api('/api/register/read', { method: 'POST', body: JSON.stringify({ offset: setupOff }) }),
+      api('/api/register/read', { method: 'POST', body: JSON.stringify({ offset: timeOff  }) }),
+    ]);
+    const setupVal = parseInt((sd.value || '0').replace(/^0x/i, ''), 16) || 0;
+    const timeVal  = parseInt((td.value || '0').replace(/^0x/i, ''), 16) || 0;
+    const enable     = Boolean(setupVal & 0x00010000);
+    const preDisable = Boolean(setupVal & 0x01000000);
+    const intrEnable = Boolean(setupVal & 0x80000000);
+    const clk  = timeVal & 0xFF;
+    const ms   = (timeVal >>> 8) & 0xFFF;
+    const unit = (timeVal >>> 20) & 0xFFF;
+    const targetMhz = ms > 0 ? parseFloat((ms / 1000).toFixed(3)) : 2.5;
+    _applyMdioSetupToUI({ enable, preDisable, intrEnable, clk, ms, unit, targetMhz });
+    setRegStatus('rv-st-mdio', `Port ${port}: SETUP=0x${setupVal.toString(16).toUpperCase().padStart(8,'0')}`, true);
+  } catch(err) { setRegStatus('rv-st-mdio', `Error: ${err.message}`, false); }
 }
 
 async function mdioApplySetup() {
@@ -4036,8 +4807,26 @@ async function mdioWritePhy() {
 
 async function mdioReadAllLink() {
   setRegStatus('rv-st-mdio-link','Reading...',true);
-  try{const data=await api('/api/mdio/link-status');if(data.ports){data.ports.forEach(p=>{const td=$(`rv-mdio-link-${p.port}`);if(!td)return;const linked=p.linkUp===true,label=p.linkUp===null?'—':(p.linkUp?'Link UP':'Link DOWN');td.innerHTML=`<span class="led-dot${linked?' connected':''}"></span> ${label}`;});}setRegStatus('rv-st-mdio-link',`Updated ${new Date().toLocaleTimeString()}`,true);}
-  catch(err){setRegStatus('rv-st-mdio-link',`Error: ${err.message}`,false);}
+  try {
+    const data = await api('/api/mdio/link-status');
+    if (data.ports) {
+      data.ports.forEach(p => {
+        const td = $(`rv-mdio-link-${p.port}`);
+        if (!td) return;
+        const linked = p.linkUp === true;
+        const label  = p.linkUp === null ? '—' : (p.linkUp ? 'Link UP' : 'Link DOWN');
+        td.innerHTML = `<span class="led-dot${linked?' connected':''}"></span> ${label}`;
+      });
+      // Cache per-port setup data and populate SETUP fields for the current port
+      _mdioSetupsCache = data.ports.map(p => p.setup ?? null);
+      const curPort = parseInt($('rv-mdio-port')?.value || '0');
+      _applyMdioSetupToUI(_mdioSetupsCache[curPort] ?? null);
+      setRegStatus('rv-st-mdio', `Read from HW (Port ${curPort})`, true);
+    }
+    setRegStatus('rv-st-mdio-link', `Updated ${new Date().toLocaleTimeString()}`, true);
+  } catch(err) {
+    setRegStatus('rv-st-mdio-link', `Error: ${err.message}`, false);
+  }
 }
 
 function initRegViewer() {
@@ -4080,13 +4869,42 @@ function initRegViewer() {
   $('testdataReadAll')?.addEventListener('click',async()=>{for(let i=0;i<TD_OFFSETS.length;i++)await rvRead(TD_OFFSETS[i],`rv-td-${i}`,`rv-st-td-${i}`);});
   $('testdataWriteAll')?.addEventListener('click',async()=>{for(let i=0;i<TD_OFFSETS.length;i++)await rvWrite(TD_OFFSETS[i],$(`rv-td-${i}`)?.value||'0x00000000',`rv-st-td-${i}`);});
 
-  $('rv-count-read')?.addEventListener('click',countRead);
-  $('rv-count-clear')?.addEventListener('click',()=>{const tbody=$('rv-count-tbody');if(tbody)tbody.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--muted);">No data</td></tr>';setRegStatus('rv-st-count','',true);});
 
-  $('rv-mdio-port')?.addEventListener('change',mdioPortChanged);$('rv-mdio-calc')?.addEventListener('click',mdioCalcMdc);$('rv-mdio-apply')?.addEventListener('click',mdioApplySetup);$('rv-mdio-read-phy')?.addEventListener('click',mdioReadPhy);$('rv-mdio-write-phy')?.addEventListener('click',mdioWritePhy);$('rv-mdio-read-link')?.addEventListener('click',mdioReadAllLink);
+  $('rv-mdio-port')?.addEventListener('change',mdioPortChanged);$('rv-mdio-calc')?.addEventListener('click',mdioCalcMdc);$('rv-mdio-read-setup')?.addEventListener('click',mdioReadSetup);$('rv-mdio-apply')?.addEventListener('click',mdioApplySetup);$('rv-mdio-read-phy')?.addEventListener('click',mdioReadPhy);$('rv-mdio-write-phy')?.addEventListener('click',mdioWritePhy);$('rv-mdio-read-link')?.addEventListener('click',mdioReadAllLink);
 
   $('rv-fdb-read-config')?.addEventListener('click',fdbCtrlReadConfig);$('fdbReadConfig')?.addEventListener('click',fdbCtrlReadConfig);
-  $('rv-fdb-apply-en')?.addEventListener('click',fdbCtrlApplyEnable);$('rv-fdb-load-default')?.addEventListener('click',fdbCtrlLoadDefault);
+  $('rv-fdb-apply-en')?.addEventListener('click',fdbCtrlApplyEnable);
+  $('rv-fdb-load-default')?.addEventListener('click',fdbCtrlLoadDefault);
+
+  // ── FDB MODE (0xA08) ────────────────────────────────────────────────────────
+  const FDB_MODE_OFF = 0xA08;
+  const FDB_MODE_BITS = [0,1,2,3,4,5,8,9];
+
+  $('rv-fdb-mode-read')?.addEventListener('click', async () => {
+    const st = $('rv-st-fdb-mode');
+    setRegStatus('rv-st-fdb-mode','Reading...',false);
+    try {
+      const val = await rvRead(FDB_MODE_OFF);
+      FDB_MODE_BITS.forEach(b => {
+        const el = $('rv-fdb-mode-' + b);
+        if (el) el.checked = !!(val & (1 << b));
+      });
+      setRegStatus('rv-st-fdb-mode','0x' + (val>>>0).toString(16).toUpperCase().padStart(8,'0'),true);
+    } catch(e) { setRegStatus('rv-st-fdb-mode','Error: '+e.message,false); }
+  });
+
+  $('rv-fdb-mode-apply')?.addEventListener('click', async () => {
+    let val = 0;
+    FDB_MODE_BITS.forEach(b => {
+      const el = $('rv-fdb-mode-' + b);
+      if (el && el.checked) val |= (1 << b);
+    });
+    setRegStatus('rv-st-fdb-mode','Applying...',false);
+    try {
+      await rvWrite(FDB_MODE_OFF, val);
+      setRegStatus('rv-st-fdb-mode','Applied 0x'+(val>>>0).toString(16).toUpperCase().padStart(8,'0'),true);
+    } catch(e) { setRegStatus('rv-st-fdb-mode','Error: '+e.message,false); }
+  });
   (()=>{
     const FDB_MAC_OPTIONS = [
       { label:'Port 0 (enp12s0f0)', value:'A0:36:9F:A8:DA:60' },
@@ -4122,6 +4940,67 @@ function initRegViewer() {
   $('rv-fdb-wrhash')?.addEventListener('click',fdbWriteByHash);$('rv-fdb-wrbucket')?.addEventListener('click',fdbWriteByBucket);
   $('rv-fdb-delete')?.addEventListener('click',fdbDeleteByHash);$('rv-fdb-initall')?.addEventListener('click',fdbInitAll);
 
+  // ── Flood Mask Table ──────────────────────────────────────────────────────────
+  function floodSession() { return $('serialPort')?.value || ''; }
+
+  function floodMaskFromCheckboxes() {
+    let mask = 0;
+    document.querySelectorAll('.fdb-flood-port').forEach(chk => {
+      if (chk.checked) mask |= (1 << Number(chk.dataset.bit));
+    });
+    return mask;
+  }
+
+  function floodMaskToCheckboxes(mask) {
+    document.querySelectorAll('.fdb-flood-port').forEach(chk => {
+      chk.checked = !!(mask & (1 << Number(chk.dataset.bit)));
+    });
+  }
+
+  $('rv-fdb-flood-read')?.addEventListener('click', async () => {
+    const vlanId = parseInt($('rv-fdb-flood-vlan')?.value || '0') & 0xFFF;
+    setRegStatus('rv-st-fdb-flood', 'Reading...', false);
+    try {
+      const res = await api('/api/fdb/flood-read', {
+        method: 'POST',
+        body: JSON.stringify({ session: floodSession(), vlanId })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      floodMaskToCheckboxes(res.mask);
+      setRegStatus('rv-st-fdb-flood',
+        `VLAN ${res.vlanId} → mask=0x${res.mask.toString(16).toUpperCase().padStart(3,'0')} (0b${res.mask.toString(2).padStart(9,'0')})`, true);
+    } catch(e) { setRegStatus('rv-st-fdb-flood', `Error: ${e.message}`, false); }
+  });
+
+  $('rv-fdb-flood-write')?.addEventListener('click', async () => {
+    const vlanId = parseInt($('rv-fdb-flood-vlan')?.value || '0') & 0xFFF;
+    const mask   = floodMaskFromCheckboxes();
+    setRegStatus('rv-st-fdb-flood', 'Writing...', false);
+    try {
+      const res = await api('/api/fdb/flood-write', {
+        method: 'POST',
+        body: JSON.stringify({ session: floodSession(), vlanId, mask })
+      });
+      if (!res.ok) throw new Error(res.error || 'write failed');
+      setRegStatus('rv-st-fdb-flood',
+        `VLAN ${vlanId} written → mask=0x${mask.toString(16).toUpperCase().padStart(3,'0')}`, true);
+    } catch(e) { setRegStatus('rv-st-fdb-flood', `Error: ${e.message}`, false); }
+  });
+
+  $('rv-fdb-flood-init')?.addEventListener('click', async () => {
+    if (!confirm('Flood Mask 테이블을 초기화하시겠습니까?')) return;
+    setRegStatus('rv-st-fdb-flood', 'Initializing...', false);
+    try {
+      const res = await api('/api/fdb/flood-init', {
+        method: 'POST',
+        body: JSON.stringify({ session: floodSession() })
+      });
+      if (!res.ok) throw new Error(res.error || 'init failed');
+      floodMaskToCheckboxes(0);
+      setRegStatus('rv-st-fdb-flood', 'Flood Mask initialized', true);
+    } catch(e) { setRegStatus('rv-st-fdb-flood', `Error: ${e.message}`, false); }
+  });
+
   $('regBaseAddr')?.addEventListener('keydown',async function(e){if(e.key!=='Enter')return;e.preventDefault();const val=this.value.trim();if(!val)return;try{await api('/api/register/base-addr',{method:'POST',body:JSON.stringify({address:val})});}catch{/*worker mode*/}await refreshRegStatus();});
   $('regBaseAddr')?.addEventListener('blur',async function(){const val=this.value.trim();if(!val)return;try{await api('/api/register/base-addr',{method:'POST',body:JSON.stringify({address:val})});}catch{/*worker mode*/}});
 }
@@ -4130,10 +5009,38 @@ function initRegViewer() {
 function initTocNav() {
   document.querySelectorAll('[data-sec]').forEach(btn => {
     btn.addEventListener('click', () => {
+      // 모든 활성 상태 초기화
       document.querySelectorAll('[data-sec]').forEach(b => b.classList.remove('toc-active'));
+
+      // 클릭한 버튼 활성화
       btn.classList.add('toc-active');
+
+      // sub 클릭 시 부모 toc-head도 활성화
+      if (btn.classList.contains('toc-sub')) {
+        const group = btn.closest('.toc-group');
+        if (group) {
+          const head = group.querySelector('.toc-head');
+          if (head) head.classList.add('toc-active');
+        }
+      }
+
+      // 대상 섹션 스크롤 + 하이라이트
       const target = document.getElementById(`rsec-${btn.dataset.sec}`);
-      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // 그룹 하이라이트 (data-highlight-group 있으면 같은 그룹 전체)
+        const group = target.dataset.highlightGroup;
+        const targets = group
+          ? document.querySelectorAll(`[data-highlight-group="${group}"]`)
+          : [target];
+        targets.forEach(el => {
+          el.style.outline = '2px solid var(--accent)';
+          el.style.outlineOffset = '2px';
+        });
+        setTimeout(() => {
+          targets.forEach(el => { el.style.outline = ''; el.style.outlineOffset = ''; });
+        }, 1500);
+      }
     });
   });
 }
@@ -4566,7 +5473,9 @@ function initApp() {
     renderCaptureRows();
   });
   $('copyPacketDetails')?.addEventListener('click', () => {
-    navigator.clipboard?.writeText($('packetDetails')?.textContent || '').then(() => toast('Copied!', 'ok'));
+    const el = $('packetDetails');
+    const text = el?.dataset.json || el?.textContent || '';
+    navigator.clipboard?.writeText(text).then(() => toast('Copied!', 'ok'));
   });
   $('copyPacketHex')?.addEventListener('click', () => {
     navigator.clipboard?.writeText($('packetHex')?.textContent || '').then(() => toast('Copied!', 'ok'));
@@ -6075,3 +6984,2234 @@ new Chart(document.getElementById('cSwMbps'),{
 </script>
 </body></html>`;
 }
+
+// ── PCP Mapper ────────────────────────────────────────────────────────────────
+(function pcpMapper() {
+  // State: ingressMap[i] = InterPriority index (0-7), or -1 if unconnected
+  //        egressMap[i]  = Egress PCP index (0-8), or -1 if unconnected
+  // Both indexed by source: ingressMap[0..8] = Ingress PCP 0..8 → Inter
+  //                         egressMap[0..7]  = Inter 0..7 → Egress PCP
+  let currentPort = 0;
+  // portData[port] = { ingress: int[9], egress: int[8] }
+  const portData = {};
+  function defaultMap() {
+    return {
+      ingress: [-1,-1,-1,-1,-1,-1,-1,-1,-1], // [0..7]=PCP#0~7, [8]=Untagged → inter idx
+      egress:  [-1,-1,-1,-1,-1,-1,-1,-1,-1], // [0..7]=Inter0~7, [8]=InterUntag → egress idx
+    };
+  }
+  function getData(port) {
+    if (!portData[port]) portData[port] = defaultMap();
+    return portData[port];
+  }
+
+  const mapper   = document.getElementById('pcpMapper');
+  if (!mapper) return;
+
+  const svg  = document.getElementById('pcpSvg');
+  const stEl = document.getElementById('rv-st-pcp');
+
+  // ── Drag state ──────────────────────────────────────────────────────────────
+  let drag = null; // { fromCol, fromIdx, ghostPath, startX, startY }
+
+  function dotCenter(dotEl) {
+    const mr  = mapper.getBoundingClientRect();
+    const dr  = dotEl.getBoundingClientRect();
+    return {
+      x: dr.left + dr.width / 2 - mr.left,
+      y: dr.top  + dr.height / 2 - mr.top,
+    };
+  }
+
+  function getDot(col, idx, side) {
+    if (col === 'inter') {
+      return mapper.querySelector(
+        `.pcp-dot[data-col="inter"][data-idx="${idx}"][data-side="${side}"]`
+      );
+    }
+    return mapper.querySelector(`.pcp-dot[data-col="${col}"][data-idx="${idx}"]`);
+  }
+
+  function cubicPath(x1, y1, x2, y2) {
+    const cx = (x1 + x2) / 2;
+    return `M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}`;
+  }
+
+  // ── Render lines ─────────────────────────────────────────────────────────────
+  function renderLines() {
+    const d = getData(currentPort);
+    // Remove all lines but keep ghost if dragging
+    svg.querySelectorAll('.pcp-line').forEach(el => el.remove());
+
+    // Ingress → Inter
+    d.ingress.forEach((inter, inIdx) => {
+      if (inter < 0) return;
+      const fromDot = getDot('ingress', inIdx, null);
+      const toDot   = getDot('inter',   inter, 'left');
+      if (!fromDot || !toDot) return;
+      const f = dotCenter(fromDot);
+      const t = dotCenter(toDot);
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', cubicPath(f.x, f.y, t.x, t.y));
+      path.classList.add('pcp-line');
+      path.addEventListener('click', () => {
+        getData(currentPort).ingress[inIdx] = -1;
+        renderLines();
+        updateDotStates();
+      });
+      svg.appendChild(path);
+    });
+
+    // Inter → Egress
+    d.egress.forEach((egIdx, interIdx) => {
+      if (egIdx < 0) return;
+      const fromDot = getDot('inter',  interIdx, 'right');
+      const toDot   = getDot('egress', egIdx,    null);
+      if (!fromDot || !toDot) return;
+      const f = dotCenter(fromDot);
+      const t = dotCenter(toDot);
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', cubicPath(f.x, f.y, t.x, t.y));
+      path.classList.add('pcp-line');
+      path.addEventListener('click', () => {
+        getData(currentPort).egress[interIdx] = -1;
+        renderLines();
+        updateDotStates();
+      });
+      svg.appendChild(path);
+    });
+  }
+
+  function updateDotStates() {
+    const d = getData(currentPort);
+    // ingress out-dots
+    mapper.querySelectorAll('.pcp-dot[data-col="ingress"]').forEach(dot => {
+      const idx = Number(dot.dataset.idx);
+      dot.classList.toggle('connected', d.ingress[idx] >= 0);
+    });
+    // inter left-dots
+    mapper.querySelectorAll('.pcp-dot[data-col="inter"][data-side="left"]').forEach(dot => {
+      const idx = Number(dot.dataset.idx);
+      const connected = d.ingress.some(v => v === idx);
+      dot.classList.toggle('connected', connected);
+    });
+    // inter right-dots (0~8 including Untagged)
+    mapper.querySelectorAll('.pcp-dot[data-col="inter"][data-side="right"]').forEach(dot => {
+      const idx = Number(dot.dataset.idx);
+      dot.classList.toggle('connected', (d.egress[idx] ?? -1) >= 0);
+    });
+    // egress in-dots
+    mapper.querySelectorAll('.pcp-dot[data-col="egress"]').forEach(dot => {
+      const idx = Number(dot.dataset.idx);
+      const connected = d.egress.some(v => v === idx);
+      dot.classList.toggle('connected', connected);
+    });
+  }
+
+  function redraw() { renderLines(); updateDotStates(); if (typeof syncRegFromWiring === 'function') syncRegFromWiring(); }
+
+  // ── Drag handlers ─────────────────────────────────────────────────────────
+  mapper.addEventListener('mousedown', e => {
+    const dot = e.target.closest('.pcp-dot');
+    if (!dot) return;
+    e.preventDefault();
+
+    const col  = dot.dataset.col;
+    const idx  = Number(dot.dataset.idx);
+    const side = dot.dataset.side || null;
+    const start = dotCenter(dot);
+
+    const ghost = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    ghost.classList.add('pcp-ghost');
+    svg.appendChild(ghost);
+
+    drag = { fromCol: col, fromIdx: idx, side, ghost, startX: start.x, startY: start.y };
+    dot.classList.add('drag-active');
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const mr = mapper.getBoundingClientRect();
+    const mx = e.clientX - mr.left;
+    const my = e.clientY - mr.top;
+    drag.ghost.setAttribute('d', cubicPath(drag.startX, drag.startY, mx, my));
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (!drag) return;
+    drag.ghost.remove();
+    const { fromCol, fromIdx, side } = drag;
+    drag = null;
+    mapper.querySelectorAll('.pcp-dot.drag-active').forEach(d => d.classList.remove('drag-active'));
+
+    const el   = document.elementFromPoint(e.clientX, e.clientY);
+    const tDot = el && el.closest('.pcp-dot');
+    if (!tDot) return;
+
+    const tCol  = tDot.dataset.col;
+    const tIdx  = Number(tDot.dataset.idx);
+    const tSide = tDot.dataset.side || null;
+    const d = getData(currentPort);
+
+    // Normalize: always store as (outCol/outIdx) → (inCol/inIdx)
+    // Ingress out → Inter left-in
+    if (fromCol === 'ingress' && tCol === 'inter') {
+      d.ingress[fromIdx] = tIdx;
+      redraw();
+    // Inter left-in ← Ingress out  (reversed drag)
+    } else if (fromCol === 'inter' && tCol === 'ingress' && side === 'left') {
+      d.ingress[tIdx] = fromIdx;
+      redraw();
+    // Inter right-out → Egress in
+    } else if (fromCol === 'inter' && tCol === 'egress' && (side === 'right' || side === null)) {
+      d.egress[fromIdx] = tIdx;
+      redraw();
+    // Egress in ← Inter right-out  (reversed drag)
+    } else if (fromCol === 'egress' && tCol === 'inter') {
+      d.egress[tIdx] = fromIdx;
+      redraw();
+    }
+  });
+
+  // ── Port buttons ────────────────────────────────────────────────────────────
+  document.getElementById('pcpPortBtns').addEventListener('click', e => {
+    const btn = e.target.closest('.pcp-port-btn');
+    if (!btn) return;
+    document.querySelectorAll('.pcp-port-btn').forEach(b => b.classList.remove('pcp-port-active'));
+    btn.classList.add('pcp-port-active');
+    currentPort = Number(btn.dataset.port);
+    redraw();
+  });
+
+  // ── Status helper ────────────────────────────────────────────────────────────
+  function setStatus(msg, ok) {
+    stEl.textContent = msg;
+    stEl.className = 'reg-status' + (ok ? ' ok' : '');
+  }
+
+  // ── Read ──────────────────────────────────────────────────────────────────────
+  async function readPort(port) {
+    const ri = await fetch('/api/table/pcp/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port, dir: 0 }),
+    }).then(r => r.json());
+    if (!ri.ok) throw new Error(ri.error);
+
+    const re = await fetch('/api/table/pcp/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port, dir: 1 }),
+    }).then(r => r.json());
+    if (!re.ok) throw new Error(re.error);
+
+    portData[port] = {
+      ingress: ri.map,
+      egress:  re.map.slice(0, 8),
+    };
+  }
+
+  document.getElementById('pcpRead').addEventListener('click', async () => {
+    setStatus('Reading...', false);
+    try {
+      await readPort(currentPort);
+      redraw();
+      setStatus('P' + currentPort + ' read OK', true);
+    } catch (e) { setStatus(e.message, false); }
+  });
+
+  document.getElementById('pcpReadAll').addEventListener('click', async () => {
+    setStatus('Reading all ports...', false);
+    try {
+      for (let p = 0; p < 9; p++) await readPort(p);
+      redraw();
+      setStatus('All ports read OK', true);
+    } catch (e) { setStatus(e.message, false); }
+  });
+
+  // ── Write ─────────────────────────────────────────────────────────────────────
+  document.getElementById('pcpWrite').addEventListener('click', async () => {
+    setStatus('Writing...', false);
+    try {
+      const d = getData(currentPort);
+      const inMap = d.ingress.map(v => v < 0 ? 0 : v);
+      const egMap = [...d.egress.map(v => v < 0 ? 0 : v), 0];
+
+      const wi = await fetch('/api/table/pcp/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: currentPort, dir: 0, map: inMap }),
+      }).then(r => r.json());
+      if (!wi.ok) throw new Error(wi.error);
+
+      const we = await fetch('/api/table/pcp/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: currentPort, dir: 1, map: egMap }),
+      }).then(r => r.json());
+      if (!we.ok) throw new Error(we.error);
+
+      setStatus('P' + currentPort + ' write OK', true);
+    } catch (e) { setStatus(e.message, false); }
+  });
+
+  // ── Reset ─────────────────────────────────────────────────────────────────────
+  document.getElementById('pcpReset').addEventListener('click', () => {
+    portData[currentPort] = defaultMap();
+    redraw();
+    setStatus('Reset to default', true);
+  });
+
+  // ── Register View ─────────────────────────────────────────────────────────────
+  let regViewDir = 0; // 0=ingress, 1=egress
+
+  // Field labels per direction
+  const FIELD_LABELS_INGRESS = ['PCP#7','PCP#6','PCP#5','PCP#4','PCP#3','PCP#2','PCP#1','PCP#0'];
+  const FIELD_LABELS_EGRESS  = ['Inter7','Inter6','Inter5','Inter4','Inter3','Inter2','Inter1','Inter0'];
+
+  // Build the 8 input fields for WR_DATA[0]
+  function buildRegFields() {
+    const container = document.getElementById('pcpRegFields0');
+    container.innerHTML = '';
+    const labels = regViewDir === 0 ? FIELD_LABELS_INGRESS : FIELD_LABELS_EGRESS;
+    // fields array: index 0 = highest bits (PCP#7/Inter7) displayed leftmost
+    for (let i = 0; i < 8; i++) {
+      const bitHi = 31 - i * 4;
+      const bitLo = bitHi - 3;
+      const srcIdx = 7 - i; // PCP#7 is at array position 7
+      const cell = document.createElement('div');
+      cell.className = 'pcp-reg-field';
+      cell.innerHTML = `
+        <div class="pcp-reg-field-bits">[${bitHi}:${bitLo}]</div>
+        <div class="pcp-reg-field-name">${labels[i]}</div>
+        <input class="pcp-reg-input" type="number" min="0" max="8"
+               data-reg-src="${srcIdx}" value="0">`;
+      container.appendChild(cell);
+    }
+
+    // Attach input handlers
+    container.querySelectorAll('.pcp-reg-input').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const srcIdx = Number(inp.dataset.regSrc);
+        let val = Math.min(8, Math.max(0, Number(inp.value) || 0));
+        inp.value = val;
+        const d = getData(currentPort);
+        if (regViewDir === 0) d.ingress[srcIdx] = val;
+        else                  d.egress[srcIdx]  = val;
+        updateRegHex();
+        renderLines();
+        updateDotStates();
+        flashInput(inp);
+      });
+    });
+  }
+
+  function flashInput(inp) {
+    inp.classList.add('synced');
+    setTimeout(() => inp.classList.remove('synced'), 600);
+  }
+
+  function updateRegHex() {
+    const d = getData(currentPort);
+    const arr = regViewDir === 0 ? d.ingress : d.egress;
+
+    // Pack WR_DATA[0]: arr[0]=PCP#0 at bits[3:0] .. arr[7]=PCP#7 at bits[31:28]
+    let word0 = 0;
+    for (let i = 0; i < 8; i++) {
+      const v = arr[i] < 0 ? 0 : arr[i];
+      word0 |= (v & 0xF) << (i * 4);
+    }
+    word0 = word0 >>> 0;
+
+    // Untagged
+    const untag = regViewDir === 0 ? (arr[8] < 0 ? 0 : arr[8]) : 0;
+    const word1 = untag & 0xF;
+
+    document.getElementById('pcpRegHex0').textContent =
+      '0x' + word0.toString(16).toUpperCase().padStart(8, '0');
+    document.getElementById('pcpRegHex1').textContent =
+      '0x' + word1.toString(16).toUpperCase().padStart(8, '0');
+
+    // Update index labels
+    const idx0 = (currentPort << 2) | (regViewDir << 1) | 0;
+    const idx1 = (currentPort << 2) | (regViewDir << 1) | 1;
+    document.getElementById('pcpRegIdx0Label').textContent = `idx = 0x${idx0.toString(16).toUpperCase()}`;
+    document.getElementById('pcpRegIdx1Label').textContent = `idx = 0x${idx1.toString(16).toUpperCase()}`;
+  }
+
+  // Sync register inputs FROM wiring state
+  function syncRegFromWiring() {
+    const d = getData(currentPort);
+    const arr = regViewDir === 0 ? d.ingress : d.egress;
+    const inputs = document.querySelectorAll('#pcpRegFields0 .pcp-reg-input');
+    inputs.forEach(inp => {
+      const srcIdx = Number(inp.dataset.regSrc);
+      inp.value = arr[srcIdx] < 0 ? 0 : arr[srcIdx];
+    });
+    const untagVal = regViewDir === 0 ? (d.ingress[8] < 0 ? 0 : d.ingress[8]) : 0;
+    document.getElementById('pcpRegUntag').value = untagVal;
+    updateRegHex();
+  }
+
+  // Untagged input handler
+  document.getElementById('pcpRegUntag').addEventListener('input', e => {
+    let val = Math.min(8, Math.max(0, Number(e.target.value) || 0));
+    e.target.value = val;
+    if (regViewDir === 0) {
+      getData(currentPort).ingress[8] = val;
+      renderLines();
+      updateDotStates();
+    }
+    updateRegHex();
+    flashInput(e.target);
+  });
+
+  // Direction toggle
+  document.querySelectorAll('input[name="pcpRegDir"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      regViewDir = Number(radio.value);
+      buildRegFields();
+      syncRegFromWiring();
+    });
+  });
+
+  // ── Initial render ────────────────────────────────────────────────────────────
+  setTimeout(() => {
+    getData(currentPort);
+    buildRegFields();
+    redraw();
+  }, 200);
+  window.addEventListener('resize', () => redraw());
+})();
+
+
+
+
+
+// ── Traffic Policer Manager ───────────────────────────────────────────────────
+(function tpManager() {
+  let currentPort = 0;
+  const slots = {};
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  // ── Conversions ──────────────────────────────────────────────────────────────
+  function gbpsToBytes(gbps) { return Math.round(Number(gbps) * 125000000); }
+  function bytesToGbps(bps)  { return (Number(bps) / 125000000).toFixed(6); }
+  function kbToBytes(kb)     { return Math.round(Number(kb) * 1024); }
+  function bytesToKb(b)      { return (Number(b) / 1024).toFixed(2); }
+
+  function fmtBytes(n) {
+    n = Number(n);
+    if (n >= 1e9)  return (n / 1e9).toFixed(3)  + ' GB/s';
+    if (n >= 1e6)  return (n / 1e6).toFixed(3)  + ' MB/s';
+    if (n >= 1e3)  return (n / 1e3).toFixed(1)  + ' KB/s';
+    return n + ' Byte/s';
+  }
+  function fmtByteSize(n) {
+    n = Number(n);
+    if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
+    if (n >= 1024)    return (n / 1024).toFixed(2)    + ' KB';
+    return n + ' Byte';
+  }
+
+  // ── Live conversion hints ────────────────────────────────────────────────────
+  function updateHints() {
+    const cir = gbpsToBytes(document.getElementById('tpEditCir').value);
+    const pir = gbpsToBytes(document.getElementById('tpEditPir').value);
+    const cbs = kbToBytes(document.getElementById('tpEditCbs').value);
+    const pbs = kbToBytes(document.getElementById('tpEditPbs').value);
+    document.getElementById('tpConvCir').textContent = '= ' + cir.toLocaleString() + ' Byte/s  (' + fmtBytes(cir) + ')';
+    document.getElementById('tpConvPir').textContent = '= ' + pir.toLocaleString() + ' Byte/s  (' + fmtBytes(pir) + ')';
+    document.getElementById('tpConvCbs').textContent = '= ' + cbs.toLocaleString() + ' Byte  ('  + fmtByteSize(cbs) + ')';
+    document.getElementById('tpConvPbs').textContent = '= ' + pbs.toLocaleString() + ' Byte  ('  + fmtByteSize(pbs) + ')';
+  }
+
+  ['tpEditCir','tpEditPir','tpEditCbs','tpEditPbs'].forEach(function(id) {
+    document.getElementById(id).addEventListener('input', updateHints);
+  });
+
+  // ── Port buttons ─────────────────────────────────────────────────────────────
+  document.querySelectorAll('.tp-port-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.tp-port-btn').forEach(function(b) { b.classList.remove('tp-port-active'); });
+      btn.classList.add('tp-port-active');
+      currentPort = Number(btn.dataset.port);
+      renderTable();
+    });
+  });
+
+  // ── Table render ─────────────────────────────────────────────────────────────
+  function renderTable() {
+    const tbody   = document.getElementById('tpEntryRows');
+    const countEl = document.getElementById('tpSlotCount');
+    const data    = slots[currentPort];
+    if (!data) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">Load port to view entries.</td></tr>';
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    const active = data.filter(function(s) { return s.valid; });
+    if (countEl) countEl.textContent = active.length + ' active / 64 slots';
+    if (!active.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No active slots.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = active.map(function(s) {
+      return '<tr class="tp-entry-row" data-idx="' + s.idx + '">' +
+        '<td>' + s.idx + '</td>' +
+        '<td>' + s.vlanId + '</td>' +
+        '<td>' + bytesToGbps(s.cir) + '</td>' +
+        '<td>' + bytesToGbps(s.pir) + '</td>' +
+        '<td>' + bytesToKb(s.cbs) + '</td>' +
+        '<td>' + bytesToKb(s.pbs) + '</td>' +
+        '<td style="text-align:center;"><button class="small tp-select-btn" data-idx="' + s.idx + '" title="Edit">&#9998;</button></td>' +
+        '</tr>';
+    }).join('');
+
+    tbody.querySelectorAll('.tp-select-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) { e.stopPropagation(); loadEditPanel(Number(btn.dataset.idx)); });
+    });
+    tbody.querySelectorAll('.tp-entry-row').forEach(function(row) {
+      row.addEventListener('click', function() { loadEditPanel(Number(row.dataset.idx)); });
+    });
+  }
+
+  // ── Load into edit panel ─────────────────────────────────────────────────────
+  function loadEditPanel(idx) {
+    const data = slots[currentPort];
+    if (!data) return;
+    const s = data[idx];
+    document.getElementById('tpEditIdx').value = idx;
+    document.getElementById('tpEditSlotLabel').textContent = '#' + idx;
+    if (s && s.valid) {
+      document.getElementById('tpEditVlanId').value = s.vlanId;
+      document.getElementById('tpEditCir').value    = bytesToGbps(s.cir);
+      document.getElementById('tpEditPir').value    = bytesToGbps(s.pir);
+      document.getElementById('tpEditCbs').value    = bytesToKb(s.cbs);
+      document.getElementById('tpEditPbs').value    = bytesToKb(s.pbs);
+    }
+    updateHints();
+    document.querySelectorAll('.tp-entry-row').forEach(function(r) { r.classList.remove('tp-row-selected'); });
+    document.querySelectorAll('.tp-entry-row[data-idx="' + idx + '"]').forEach(function(r) { r.classList.add('tp-row-selected'); });
+    const statusRow = document.getElementById('tpStatusRow');
+    if (statusRow) statusRow.style.display = (s && s.valid) ? '' : 'none';
+    document.getElementById('tpEditVlanId').focus();
+  }
+
+  // ── Load Port ────────────────────────────────────────────────────────────────
+  document.getElementById('tpLoadPort').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-tp');
+    st.textContent = 'Loading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/table/tp/read-port', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      slots[currentPort] = res.slots;
+      renderTable();
+      st.textContent = 'Loaded port ' + currentPort; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Clear All ────────────────────────────────────────────────────────────────
+  document.getElementById('tpClearAll').addEventListener('click', async function() {
+    const st   = document.getElementById('rv-st-tp');
+    const data = slots[currentPort];
+    if (!data) { st.textContent = 'Load port first'; st.style.color = 'var(--muted)'; return; }
+    const active = data.filter(function(s) { return s.valid; });
+    if (!active.length) { st.textContent = 'No active slots'; st.style.color = 'var(--muted)'; return; }
+    st.textContent = 'Clearing ' + active.length + ' slots...'; st.style.color = 'var(--muted)';
+    try {
+      for (const s of active) {
+        await api('/api/table/tp/delete', {
+          method: 'POST',
+          body: JSON.stringify({ session: getSession(), port: currentPort, idx: s.idx })
+        });
+        data[s.idx].valid = false;
+      }
+      renderTable();
+      st.textContent = 'Cleared'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Read (single slot) ───────────────────────────────────────────────────────
+  document.getElementById('tpEditRead').addEventListener('click', async function() {
+    const st  = document.getElementById('rv-st-tp-edit');
+    const idx = Number(document.getElementById('tpEditIdx').value);
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/table/tp/read-port', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      slots[currentPort] = res.slots;
+      renderTable();
+      const s = res.slots[idx];
+      if (s && s.valid) {
+        loadEditPanel(idx);
+        st.textContent = 'Slot ' + idx + ' read'; st.style.color = 'var(--green)';
+      } else {
+        st.textContent = 'Slot ' + idx + ' is empty (Valid=0)'; st.style.color = 'var(--muted)';
+      }
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Write ────────────────────────────────────────────────────────────────────
+  document.getElementById('tpEditWrite').addEventListener('click', async function() {
+    const st     = document.getElementById('rv-st-tp-edit');
+    const idx    = Number(document.getElementById('tpEditIdx').value);
+    const vlanId = Number(document.getElementById('tpEditVlanId').value);
+    const cir    = gbpsToBytes(document.getElementById('tpEditCir').value);
+    const pir    = gbpsToBytes(document.getElementById('tpEditPir').value);
+    const cbs    = kbToBytes(document.getElementById('tpEditCbs').value);
+    const pbs    = kbToBytes(document.getElementById('tpEditPbs').value);
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/table/tp/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort, idx, vlanId, cir, pir, cbs, pbs })
+      });
+      if (!res.ok) throw new Error(res.error || 'write failed');
+      if (!slots[currentPort]) {
+        slots[currentPort] = Array.from({length: 64}, function(_, i) { return { idx: i, valid: false }; });
+      }
+      slots[currentPort][idx] = { idx: idx, valid: true, vlanId: vlanId, cir: cir, pir: pir, cbs: cbs, pbs: pbs };
+      renderTable();
+      loadEditPanel(idx);
+      st.textContent = 'Slot ' + idx + ' written'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Delete ───────────────────────────────────────────────────────────────────
+  document.getElementById('tpEditDelete').addEventListener('click', async function() {
+    const st  = document.getElementById('rv-st-tp-edit');
+    const idx = Number(document.getElementById('tpEditIdx').value);
+    st.textContent = 'Deleting...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/table/tp/delete', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort, idx: idx })
+      });
+      if (!res.ok) throw new Error(res.error || 'delete failed');
+      if (slots[currentPort]) slots[currentPort][idx] = { idx: idx, valid: false };
+      renderTable();
+      const statusRow = document.getElementById('tpStatusRow');
+      if (statusRow) statusRow.style.display = 'none';
+      st.textContent = 'Slot ' + idx + ' deleted'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Bucket Status Refresh ────────────────────────────────────────────────────
+  document.getElementById('tpStatusRefresh').addEventListener('click', async function() {
+    const st  = document.getElementById('rv-st-tp-edit');
+    const idx = Number(document.getElementById('tpEditIdx').value);
+    try {
+      const res = await api('/api/table/tp/read-status', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort, idx: idx })
+      });
+      if (!res.ok) throw new Error(res.error || 'status read failed');
+      document.getElementById('tpStatusCbk').value = res.cbk;
+      document.getElementById('tpStatusPbk').value = res.pbk;
+      st.textContent = 'Status refreshed'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // Initial hint update
+  updateHints();
+})();
+
+
+
+// ── Credit Based Shaper Manager ──────────────────────────────────────────────
+(function cbsManager() {
+  let currentPort = 0;
+  // cache[port][pcp] = { idleSlope, idleSlopeTick, sendSlopeTick, hiCredit, loCredit }
+  const cache = {};
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function getPortParams() {
+    const speed = Number(document.getElementById('cbsPortSpeed').value);
+    const clk   = speed >= 10000000000 ? 156250000 : 125000000;
+    const mtu   = Number(document.getElementById('cbsMtu').value) || 1522;
+    return { speed, clk, mtu };
+  }
+
+  function gcd(a, b) { a = Math.abs(a); b = Math.abs(b); while (b) { const t = b; b = a % b; a = t; } return a; }
+
+  function calcCbs(idleSlope) {
+    const { speed, clk, mtu } = getPortParams();
+    idleSlope = Number(idleSlope) || 0;
+    const sendSlope     = speed - idleSlope;
+    const bitPerTick    = speed / clk;
+    const mtuTick       = Math.ceil((mtu * 8) / bitPerTick);
+    const g             = gcd(idleSlope, sendSlope) || 1;
+    const idleSlopeTick = Math.ceil(idleSlope / g);
+    const sendSlopeTick = Math.ceil(sendSlope / g);
+    const hiCredit      = mtuTick * idleSlopeTick;
+    const loCredit      = mtuTick * sendSlopeTick;
+    return { idleSlope, sendSlope, bitPerTick, mtuTick, g, idleSlopeTick, sendSlopeTick, hiCredit, loCredit };
+  }
+
+  function updateRowCalc(tr, d) {
+    tr.querySelector('.cbs-idle-tick').textContent = d.idleSlopeTick.toLocaleString();
+    tr.querySelector('.cbs-send-tick').textContent = d.sendSlopeTick.toLocaleString();
+    tr.querySelector('.cbs-hi').textContent        = d.hiCredit.toLocaleString();
+    tr.querySelector('.cbs-lo').textContent        = d.loCredit.toLocaleString();
+  }
+
+  function initTable() {
+    const tbody = document.getElementById('cbsPcpRows');
+    tbody.innerHTML = '';
+    for (let pcp = 0; pcp < 8; pcp++) {
+      const tr = document.createElement('tr');
+      tr.dataset.pcp = pcp;
+      tr.innerHTML =
+        '<td>PCP ' + pcp + '</td>' +
+        '<td><input class="cbs-idle-input" type="number" min="0" step="1000000" value="0" style="width:100%;"></td>' +
+        '<td class="cbs-idle-tick">0</td>' +
+        '<td class="cbs-send-tick">0</td>' +
+        '<td class="cbs-hi">0</td>' +
+        '<td class="cbs-lo">0</td>';
+      tbody.appendChild(tr);
+
+      tr.querySelector('.cbs-idle-input').addEventListener('input', function() {
+        const calc = calcCbs(this.value);
+        updateRowCalc(tr, calc);
+        if (!cache[currentPort]) cache[currentPort] = {};
+        cache[currentPort][pcp] = {
+          idleSlope: Number(this.value),
+          idleSlopeTick: calc.idleSlopeTick,
+          sendSlopeTick: calc.sendSlopeTick,
+          hiCredit: calc.hiCredit,
+          loCredit: calc.loCredit
+        };
+      });
+    }
+  }
+
+  // ── Port buttons ─────────────────────────────────────────────────────────────
+  document.querySelectorAll('.cbs-port-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.cbs-port-btn').forEach(function(b) { b.classList.remove('cbs-port-active'); });
+      btn.classList.add('cbs-port-active');
+      currentPort = Number(btn.dataset.port);
+      loadCacheToTable();
+    });
+  });
+
+  function loadCacheToTable() {
+    document.querySelectorAll('#cbsPcpRows tr').forEach(function(tr) {
+      const pcp  = Number(tr.dataset.pcp);
+      const data = cache[currentPort] && cache[currentPort][pcp];
+      const inp  = tr.querySelector('.cbs-idle-input');
+      if (data) {
+        inp.value = data.idleSlope || 0;
+        updateRowCalc(tr, data);
+      } else {
+        inp.value = 0;
+        updateRowCalc(tr, { idleSlopeTick: 0, sendSlopeTick: 0, hiCredit: 0, loCredit: 0 });
+      }
+    });
+  }
+
+  // ── Read Port ────────────────────────────────────────────────────────────────
+  document.getElementById('cbsReadPort').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-cbs');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/table/cbs/read-port', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), port: currentPort })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      if (!cache[currentPort]) cache[currentPort] = {};
+      res.pcps.forEach(function(p) {
+        cache[currentPort][p.pcp] = {
+          idleSlope: 0,
+          idleSlopeTick: p.idleSlopeTick,
+          sendSlopeTick: p.sendSlopeTick,
+          hiCredit: p.hiCredit,
+          loCredit: p.loCredit
+        };
+      });
+      document.querySelectorAll('#cbsPcpRows tr').forEach(function(tr) {
+        const pcp  = Number(tr.dataset.pcp);
+        const data = cache[currentPort][pcp];
+        if (data) updateRowCalc(tr, data);
+      });
+      st.textContent = 'Port ' + currentPort + ' read'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Write All ────────────────────────────────────────────────────────────────
+  document.getElementById('cbsWriteAll').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-cbs');
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      for (let pcp = 0; pcp < 8; pcp++) {
+        const data = cache[currentPort] && cache[currentPort][pcp];
+        if (!data) continue;
+        const res = await api('/api/table/cbs/write', {
+          method: 'POST',
+          body: JSON.stringify({
+            session: getSession(), port: currentPort, pcp,
+            idleSlopeTick: data.idleSlopeTick,
+            sendSlopeTick: data.sendSlopeTick,
+            loCredit: data.loCredit,
+            hiCredit: data.hiCredit
+          })
+        });
+        if (!res.ok) throw new Error('PCP ' + pcp + ': ' + (res.error || 'write failed'));
+      }
+      st.textContent = 'All PCPs written'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Port speed / MTU change → recalculate all rows ───────────────────────────
+  ['cbsPortSpeed', 'cbsMtu'].forEach(function(id) {
+    document.getElementById(id).addEventListener('change', function() {
+      document.querySelectorAll('#cbsPcpRows tr').forEach(function(tr) {
+        const pcp  = Number(tr.dataset.pcp);
+        const inp  = tr.querySelector('.cbs-idle-input');
+        const calc = calcCbs(inp.value);
+        updateRowCalc(tr, calc);
+        if (!cache[currentPort]) cache[currentPort] = {};
+        cache[currentPort][pcp] = {
+          idleSlope: Number(inp.value),
+          idleSlopeTick: calc.idleSlopeTick,
+          sendSlopeTick: calc.sendSlopeTick,
+          hiCredit: calc.hiCredit,
+          loCredit: calc.loCredit
+        };
+      });
+    });
+  });
+
+  initTable();
+})();
+
+
+// ── TGSW Switch Control Manager ──────────────────────────────────────────────
+(function swCtrlManager() {
+  // SWITCH_CONTROL_0 = BASE + 0x2C0, SWITCH_CONTROL_1 = BASE + 0x2C4
+  const OFF_CTRL0 = 0x2C0;
+  const OFF_CTRL1 = 0x2C4;
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function getCheckedBits(cls) {
+    let val = 0;
+    document.querySelectorAll('.' + cls).forEach(function(chk) {
+      if (chk.checked) val |= (1 << Number(chk.dataset.port));
+    });
+    return val >>> 0;
+  }
+
+  function setCheckedBits(cls, val) {
+    document.querySelectorAll('.' + cls).forEach(function(chk) {
+      chk.checked = !!(val & (1 << Number(chk.dataset.port)));
+    });
+  }
+
+  // ── Read functions ───────────────────────────────────────────────────────────
+  async function readSwCtrl() {
+    const st = document.getElementById('rv-st-sw-ctrl');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const r0 = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_CTRL0 })
+      });
+      const r1 = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_CTRL1 })
+      });
+      if (!r0.ok) throw new Error(r0.error || 'CTRL_0 read failed');
+      if (!r1.ok) throw new Error(r1.error || 'CTRL_1 read failed');
+
+      const ctrl0 = r0.value >>> 0;
+      const ctrl1 = r1.value >>> 0;
+
+      setCheckedBits('sw-promisc', (ctrl0 >> 0)  & 0xFF);
+      setCheckedBits('sw-tp',      (ctrl0 >> 8)  & 0x1FF);
+      setCheckedBits('sw-cbs',     (ctrl0 >> 20) & 0x1FF);
+      setCheckedBits('sw-tas',     (ctrl1 >> 0)  & 0x1FF);
+      setCheckedBits('sw-ats',     (ctrl1 >> 16) & 0x1FF);
+
+      st.textContent = 'CTRL_0=0x' + ctrl0.toString(16).toUpperCase().padStart(8,'0') +
+                       '  CTRL_1=0x' + ctrl1.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Write ───────────────────────────────────────────────────────────────────
+  document.getElementById('swCtrlWrite').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-sw-ctrl');
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const promisc = getCheckedBits('sw-promisc') & 0xFF;
+      const tp      = getCheckedBits('sw-tp')      & 0x1FF;
+      const cbs     = getCheckedBits('sw-cbs')     & 0x1FF;
+      const tas     = getCheckedBits('sw-tas')     & 0x1FF;
+      const ats     = getCheckedBits('sw-ats')     & 0x1FF;
+
+      const ctrl0 = (promisc << 0) | (tp << 8) | (cbs << 20);
+      const ctrl1 = (tas << 0) | (ats << 16);
+
+      const w0 = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_CTRL0, value: ctrl0 >>> 0 })
+      });
+      const w1 = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_CTRL1, value: ctrl1 >>> 0 })
+      });
+      if (!w0.ok) throw new Error(w0.error || 'CTRL_0 write failed');
+      if (!w1.ok) throw new Error(w1.error || 'CTRL_1 write failed');
+
+      st.textContent = 'Written — CTRL_0=0x' + (ctrl0>>>0).toString(16).toUpperCase().padStart(8,'0') +
+                       '  CTRL_1=0x' + (ctrl1>>>0).toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── READ ALL ─────────────────────────────────────────────────────────────────
+  document.getElementById('swReadAll').addEventListener('click', async function() {
+    await readSwCtrl();
+    await readTermCtrl();
+    await readLenCtrl();
+    await readMyMac();
+  });
+})();
+
+
+// ── Terminal Control Manager ──────────────────────────────────────────────────
+(function termCtrlManager() {
+  const OFF_TERM = 0x2C8;
+  const CLK_1G   = 125;      // MHz
+  const CLK_10G  = 156.25;   // MHz
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  // ns → clocks (rounded)
+  function nsToClk(ns, mhz) { return Math.round(Number(ns) * mhz / 1000); }
+  // clocks → ns
+  function clkToNs(clk, mhz) { return (Number(clk) * 1000 / mhz).toFixed(2); }
+
+  // live update: ns 입력 → 클럭 수 자동계산
+  document.getElementById('termIfs1gNs').addEventListener('input', function() {
+    document.getElementById('termIfs1gClk').value = nsToClk(this.value, CLK_1G);
+  });
+  document.getElementById('termIfs10gNs').addEventListener('input', function() {
+    document.getElementById('termIfs10gClk').value = nsToClk(this.value, CLK_10G);
+  });
+
+  async function readTermCtrl() {
+    const st = document.getElementById('rv-st-term-ctrl');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_TERM })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      const val = res.value >>> 0;
+      const clk1g  = (val >> 0) & 0x1F;
+      const clk10g = (val >> 8) & 0x1F;
+      document.getElementById('termIfs1gClk').value  = clk1g;
+      document.getElementById('termIfs10gClk').value = clk10g;
+      document.getElementById('termIfs1gNs').value   = clkToNs(clk1g,  CLK_1G);
+      document.getElementById('termIfs10gNs').value  = clkToNs(clk10g, CLK_10G);
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8, '0') +
+                       '  (1G=' + clk1g + 'clk/' + clkToNs(clk1g, CLK_1G) + 'ns' +
+                       ', 10G=' + clk10g + 'clk/' + clkToNs(clk10g, CLK_10G) + 'ns)';
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Write ───────────────────────────────────────────────────────────────────
+  document.getElementById('termCtrlWrite').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-term-ctrl');
+    const clk1g  = nsToClk(document.getElementById('termIfs1gNs').value,  CLK_1G)  & 0x1F;
+    const clk10g = nsToClk(document.getElementById('termIfs10gNs').value, CLK_10G) & 0x1F;
+    const val = (clk1g << 0) | (clk10g << 8);
+
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_TERM, value: val >>> 0 })
+      });
+      if (!res.ok) throw new Error(res.error || 'write failed');
+      document.getElementById('termIfs1gClk').value  = clk1g;
+      document.getElementById('termIfs10gClk').value = clk10g;
+      st.textContent = '0x' + (val>>>0).toString(16).toUpperCase().padStart(8,'0') +
+                       '  (1G=' + clk1g + 'clk, 10G=' + clk10g + 'clk)';
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+// ── Length Control Manager ────────────────────────────────────────────────────
+(function lenCtrlManager() {
+  const OFF_LEN = 0x2CC;
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  async function readLenCtrl() {
+    const st = document.getElementById('rv-st-len-ctrl');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_LEN })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      const val = res.value >>> 0;
+      const minLen = (val >> 0)  & 0x7FF;
+      const maxLen = (val >> 16) & 0x7FF;
+      document.getElementById('lenMin').value = minLen;
+      document.getElementById('lenMax').value = maxLen;
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8,'0') +
+                       '  (MAX=' + maxLen + ', MIN=' + minLen + ')';
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Write ───────────────────────────────────────────────────────────────────
+  document.getElementById('lenCtrlWrite').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-len-ctrl');
+    const minLen = Number(document.getElementById('lenMin').value) & 0x7FF;
+    const maxLen = Number(document.getElementById('lenMax').value) & 0x7FF;
+    const val = (minLen << 0) | (maxLen << 16);
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_LEN, value: val >>> 0 })
+      });
+      if (!res.ok) throw new Error(res.error || 'write failed');
+      st.textContent = '0x' + (val>>>0).toString(16).toUpperCase().padStart(8,'0') +
+                       '  (MAX=' + maxLen + ', MIN=' + minLen + ')';
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+// ── My MAC Address Manager ────────────────────────────────────────────────────
+(function myMacManager() {
+  const OFF_MAC0 = 0x2D0;  // MY_MAC_ADDR_0: MAC [31:0]
+  const OFF_MAC1 = 0x2D4;  // MY_MAC_ADDR_1: MAC [47:32]
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  // MAC string -> { mac0, mac1 }
+  // "B4:2E:99:DE:74:16" -> mac1=0xB42E, mac0=0x99DE7416
+  function parseMac(str) {
+    const bytes = str.split(':').map(function(h) { return parseInt(h, 16); });
+    if (bytes.length !== 6 || bytes.some(isNaN)) throw new Error('올바른 MAC 형식이 아닙니다 (XX:XX:XX:XX:XX:XX)');
+    const mac1 = ((bytes[0] << 8) | bytes[1]) & 0xFFFF;
+    const mac0 = ((bytes[2] << 24) | (bytes[3] << 16) | (bytes[4] << 8) | bytes[5]) >>> 0;
+    return { mac0, mac1 };
+  }
+
+  // { mac0, mac1 } -> MAC string
+  function formatMac(mac0, mac1) {
+    const b = [
+      (mac1 >> 8) & 0xFF, mac1 & 0xFF,
+      (mac0 >> 24) & 0xFF, (mac0 >> 16) & 0xFF,
+      (mac0 >> 8)  & 0xFF,  mac0 & 0xFF
+    ];
+    return b.map(function(x) { return x.toString(16).toUpperCase().padStart(2,'0'); }).join(':');
+  }
+
+  async function readMyMac() {
+    const st = document.getElementById('rv-st-my-mac');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const r0 = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_MAC0 })
+      });
+      const r1 = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_MAC1 })
+      });
+      if (!r0.ok) throw new Error(r0.error || 'MAC_0 read failed');
+      if (!r1.ok) throw new Error(r1.error || 'MAC_1 read failed');
+      const mac0 = r0.value >>> 0;
+      const mac1 = r1.value & 0xFFFF;
+      const macStr = formatMac(mac0, mac1);
+      document.getElementById('myMacInput').value = macStr;
+      st.textContent = macStr; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Write ───────────────────────────────────────────────────────────────────
+  document.getElementById('myMacWrite').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-my-mac');
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const { mac0, mac1 } = parseMac(document.getElementById('myMacInput').value);
+      const w0 = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_MAC0, value: mac0 })
+      });
+      const w1 = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF_MAC1, value: mac1 })
+      });
+      if (!w0.ok) throw new Error(w0.error || 'MAC_0 write failed');
+      if (!w1.ok) throw new Error(w1.error || 'MAC_1 write failed');
+      st.textContent = formatMac(mac0, mac1) + ' written'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+
+// ── PORT RX Frame Info Manager ────────────────────────────────────────────────
+(function rxFrameManager() {
+  const SW_REGION = 0x2C0;
+  const RX_BASE   = SW_REGION + 0x040;
+  const PORT_STEP = 0x040;
+  const NUM_PORTS = 8;
+
+  let pollTimer = null;
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function rxOffset(port) { return RX_BASE + port * PORT_STEP; }
+
+  function parseRxVal(val) {
+    val = val >>> 0;
+    const length    = (val >> 0)  & 0x7FF;
+    const queueFull = (val >> 11) & 0x1;
+    const fcsError  = (val >> 12) & 0x1;
+    const memFail   = (val >> 13) & 0x1;
+    const poResult  = (val >> 14) & 0x3;
+    const vid       = (val >> 16) & 0xFFF;
+    const pcp       = (val >> 28) & 0xF;
+    return { length, queueFull, fcsError, memFail, poResult, vid, pcp };
+  }
+
+  function policerHtml(po) {
+    if (po === 0x0) return '<span class="rx-policer-green">Green</span>';
+    if (po === 0x1) return '<span class="rx-policer-yellow">Yellow</span>';
+    if (po === 0x3) return '<span class="rx-policer-red">Red</span>';
+    return '—';
+  }
+
+  function flagHtml(v) {
+    return v ? '<span class="rx-flag-dot active" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--red);"></span>'
+             : '<span style="color:var(--muted);">—</span>';
+  }
+
+  function pcpText(pcp) { return pcp === 8 ? 'Untag' : 'PCP ' + pcp; }
+
+  // ── Read all ports ────────────────────────────────────────────────────────────
+  async function doReadAll() {
+    const st   = document.getElementById('rv-st-rx-frame');
+    const tbody = document.getElementById('rxTableBody');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const rows = [];
+      for (let p = 0; p < NUM_PORTS; p++) {
+        const res = await api('/api/register/read', {
+          method: 'POST',
+          body: JSON.stringify({ session: getSession(), offset: rxOffset(p) })
+        });
+        if (!res.ok) throw new Error('P' + p + ': ' + (res.error || 'read failed'));
+        const d = parseRxVal(res.value);
+        rows.push(
+          '<tr>' +
+          '<td><b>P' + p + '</b></td>' +
+          '<td>' + d.length + '</td>' +
+          '<td>' + d.vid + '</td>' +
+          '<td>' + pcpText(d.pcp) + '</td>' +
+          '<td>' + policerHtml(d.poResult) + '</td>' +
+          '<td style="text-align:center;">' + flagHtml(d.queueFull) + '</td>' +
+          '<td style="text-align:center;">' + flagHtml(d.fcsError)  + '</td>' +
+          '<td style="text-align:center;">' + flagHtml(d.memFail)   + '</td>' +
+          '</tr>'
+        );
+      }
+      tbody.innerHTML = rows.join('');
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('rxRead').addEventListener('click', doReadAll);
+
+  // ── Auto Poll ────────────────────────────────────────────────────────────────
+  function startPoll() {
+    const ms = Number(document.getElementById('rxPollInterval').value) || 500;
+    pollTimer = setInterval(doReadAll, ms);
+  }
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  document.getElementById('rxAutoPoll').addEventListener('change', function() {
+    if (this.checked) startPoll(); else stopPoll();
+  });
+  document.getElementById('rxPollInterval').addEventListener('change', function() {
+    if (document.getElementById('rxAutoPoll').checked) { stopPoll(); startPoll(); }
+  });
+})();
+
+
+// ── PORT RX Counters Manager ──────────────────────────────────────────────────
+(function rxCntManager() {
+  const SW_REGION = 0x2C0;
+  const RX_BASE   = SW_REGION + 0x040;
+  const PORT_STEP = 0x040;
+  const NUM_PORTS = 8;
+
+  const COUNTERS = [
+    { name: 'CNT_RX_TRY',      offset: 0x004, desc: 'Total Received'   },
+    { name: 'CNT_RX_FCS_ERR',  offset: 0x008, desc: 'FCS Error'        },
+    { name: 'CNT_RX_LEN_FAIL', offset: 0x00C, desc: 'Length Fail'      },
+    { name: 'CNT_RX_PO_DROP',  offset: 0x010, desc: 'Policer Drop'     },
+    { name: 'CNT_RX_QUE_FULL', offset: 0x014, desc: 'Queue Full Drop'  },
+    { name: 'CNT_RX_MEM_FULL', offset: 0x018, desc: 'Memory Full Drop' },
+    { name: 'CNT_RX_LK_DROP',  offset: 0x01C, desc: 'Lookup Drop'      },
+    { name: 'CNT_RX_LK_BLK',   offset: 0x020, desc: 'Lookup Block'     },
+    { name: 'CNT_RX_SUCC',     offset: 0x024, desc: 'Success'          },
+  ];
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function portBase(port) { return RX_BASE + port * PORT_STEP; }
+
+  document.getElementById('rxCntReadAll').addEventListener('click', async function() {
+    const st    = document.getElementById('rv-st-rx-cnt');
+    const tbody = document.getElementById('rxCntBody');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      // Read all: counters × ports
+      // Build 2D array: values[counterIdx][portIdx]
+      const values = COUNTERS.map(function() { return new Array(NUM_PORTS).fill(0); });
+
+      for (let p = 0; p < NUM_PORTS; p++) {
+        for (let c = 0; c < COUNTERS.length; c++) {
+          const res = await api('/api/register/read', {
+            method: 'POST',
+            body: JSON.stringify({ session: getSession(), offset: portBase(p) + COUNTERS[c].offset })
+          });
+          if (!res.ok) throw new Error('P' + p + ' ' + COUNTERS[c].name + ': ' + (res.error || 'failed'));
+          values[c][p] = res.value >>> 0;
+        }
+      }
+
+      // Render rows
+      tbody.innerHTML = COUNTERS.map(function(cnt, ci) {
+        const cells = values[ci].map(function(v, pi) {
+          const color = (cnt.name !== 'CNT_RX_TRY' && cnt.name !== 'CNT_RX_SUCC' && v > 0)
+            ? 'color:var(--red);font-weight:700;'
+            : '';
+          return '<td style="text-align:right;' + color + '">' + v.toLocaleString() + '</td>';
+        }).join('');
+        return '<tr>' +
+          '<td><span style="font-size:11px;">' + cnt.desc + '</span><br><small style="color:var(--muted);">' + cnt.name + '</small></td>' +
+          '<td style="color:var(--muted);font-size:10px;">+0x' + cnt.offset.toString(16).toUpperCase().padStart(3,'0') + '</td>' +
+          cells + '</tr>';
+      }).join('');
+
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+// ── TGSW FABRIC Manager ───────────────────────────────────────────────────────
+(function fabricManager() {
+  const FBR_BASE = 0x540;  // TGSW_FBR_REGION = TGSW_SW_REGION(0x2C0) + 0x280
+
+  const OFF = {
+    SMEM_CTRL:     FBR_BASE + 0x000,
+    AREA_MAP_0:    FBR_BASE + 0x004,  // AREA #0~31
+    AREA_MAP_1:    FBR_BASE + 0x008,  // AREA #32~63
+    AREA_MAP_2:    FBR_BASE + 0x00C,  // AREA #64~95
+    AREA_MAP_3:    FBR_BASE + 0x010,  // AREA #96~127
+    CNT_TRY:       FBR_BASE + 0x040,
+    CNT_FULL:      FBR_BASE + 0x044,
+    CNT_AGE_CLR:   FBR_BASE + 0x048,
+  };
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  // ── Init AREA grid (128 cells) ───────────────────────────────────────────────
+  function initAreaGrid() {
+    const grid = document.getElementById('smemAreaGrid');
+    grid.innerHTML = '';
+    for (let i = 0; i < 128; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'smem-area-cell smem-area-empty';
+      cell.id = 'smem-area-' + i;
+      cell.title = 'AREA #' + i + ': Empty';
+      grid.appendChild(cell);
+    }
+  }
+
+  // ── Update AREA grid from 4 map registers ────────────────────────────────────
+  function updateAreaGrid(maps) {
+    let dirtyCount = 0;
+    for (let reg = 0; reg < 4; reg++) {
+      const val = maps[reg] >>> 0;
+      for (let bit = 0; bit < 32; bit++) {
+        const areaIdx = reg * 32 + bit;
+        const isDirty = !!(val & (1 << bit));
+        const cell = document.getElementById('smem-area-' + areaIdx);
+        if (!cell) continue;
+        if (isDirty) {
+          cell.className = 'smem-area-cell smem-area-dirty';
+          cell.title = 'AREA #' + areaIdx + ': Dirty (in use)';
+          dirtyCount++;
+        } else {
+          cell.className = 'smem-area-cell smem-area-empty';
+          cell.title = 'AREA #' + areaIdx + ': Empty';
+        }
+      }
+    }
+    const pct = ((dirtyCount / 128) * 100).toFixed(1);
+    document.getElementById('smemMapStat').textContent =
+      'Dirty: ' + dirtyCount + ' / 128  (' + pct + '% 사용 중)';
+    document.getElementById('smemMapStat').style.color =
+      dirtyCount > 100 ? 'var(--red)' : dirtyCount > 64 ? '#F59E0B' : 'var(--green)';
+  }
+
+  // ── Read SMEM CONTROL ────────────────────────────────────────────────────────
+  async function readSmemCtrl() {
+    const st = document.getElementById('rv-st-smem-ctrl');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/read', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF.SMEM_CTRL })
+      });
+      if (!res.ok) throw new Error(res.error || 'read failed');
+      const val = res.value >>> 0;
+      document.getElementById('smemAgeLimit').value  = (val >> 0) & 0xFF;
+      document.getElementById('smemAgeEnable').checked = !!((val >> 8) & 0x1);
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Read AREA MAP ────────────────────────────────────────────────────────────
+  async function readAreaMap() {
+    const st = document.getElementById('rv-st-smem-map');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const maps = [];
+      for (const off of [OFF.AREA_MAP_0, OFF.AREA_MAP_1, OFF.AREA_MAP_2, OFF.AREA_MAP_3]) {
+        const res = await api('/api/register/read', {
+          method: 'POST',
+          body: JSON.stringify({ session: getSession(), offset: off })
+        });
+        if (!res.ok) throw new Error(res.error || 'read failed');
+        maps.push(res.value >>> 0);
+      }
+      updateAreaGrid(maps);
+      st.textContent = maps.map(function(v) { return '0x' + v.toString(16).toUpperCase().padStart(8,'0'); }).join('  ');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Read COUNTERS ────────────────────────────────────────────────────────────
+  async function readCounters() {
+    const st = document.getElementById('rv-st-smem-cnt');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const tryRes  = await api('/api/register/read', { method: 'POST', body: JSON.stringify({ session: getSession(), offset: OFF.CNT_TRY     }) });
+      const fullRes = await api('/api/register/read', { method: 'POST', body: JSON.stringify({ session: getSession(), offset: OFF.CNT_FULL    }) });
+      const ageRes  = await api('/api/register/read', { method: 'POST', body: JSON.stringify({ session: getSession(), offset: OFF.CNT_AGE_CLR }) });
+      if (!tryRes.ok)  throw new Error(tryRes.error  || 'CNT_TRY read failed');
+      if (!fullRes.ok) throw new Error(fullRes.error || 'CNT_FULL read failed');
+      if (!ageRes.ok)  throw new Error(ageRes.error  || 'CNT_AGE_CLR read failed');
+
+      const tryVal  = tryRes.value  >>> 0;
+      const fullVal = fullRes.value >>> 0;
+      const ageVal  = ageRes.value  >>> 0;
+
+      const tryEl  = document.getElementById('smemCntTry');
+      const fullEl = document.getElementById('smemCntFull');
+      const ageEl  = document.getElementById('smemCntAge');
+
+      tryEl.textContent  = tryVal.toLocaleString();
+      tryEl.style.color  = 'var(--fg)';
+
+      fullEl.textContent = fullVal.toLocaleString();
+      fullEl.style.color = fullVal > 0 ? 'var(--red)' : 'var(--fg)';
+
+      ageEl.textContent  = ageVal.toLocaleString();
+      ageEl.style.color  = 'var(--fg)';
+
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── Apply SMEM CONTROL ───────────────────────────────────────────────────────
+  document.getElementById('smemCtrlApply').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-smem-ctrl');
+    const ageLimit  = Number(document.getElementById('smemAgeLimit').value)  & 0xFF;
+    const ageEnable = document.getElementById('smemAgeEnable').checked ? 1 : 0;
+    const val = (ageLimit << 0) | (ageEnable << 8);
+    st.textContent = 'Writing...'; st.style.color = 'var(--muted)';
+    try {
+      const res = await api('/api/register/write', {
+        method: 'POST',
+        body: JSON.stringify({ session: getSession(), offset: OFF.SMEM_CTRL, value: val >>> 0 })
+      });
+      if (!res.ok) throw new Error(res.error || 'write failed');
+      st.textContent = '0x' + (val>>>0).toString(16).toUpperCase().padStart(8,'0') + ' written';
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── READ ALL ─────────────────────────────────────────────────────────────────
+  document.getElementById('fabricReadAll').addEventListener('click', async function() {
+    await readSmemCtrl();
+    await readAreaMap();
+    await readCounters();
+    if (window._fabricReadWrRd) await window._fabricReadWrRd();
+  });
+
+  // ── Init ────────────────────────────────────────────────────────────────────
+  initAreaGrid();
+})();
+
+
+
+// ── TGSW FABRIC WR / RD Port Counters ────────────────────────────────────────
+(function fabricWrManager() {
+  const FBR_BASE = 0x540;
+  const WR_BASE  = FBR_BASE + 0x080;  // CNT_WR_PORT_0 ~ 8
+  const RD_BASE  = FBR_BASE + 0x0C0;  // CNT_RD_PORT_0 ~ 8
+
+  const PORTS = [
+    { label: 'P0',  offset: 0x00 },
+    { label: 'P1',  offset: 0x04 },
+    { label: 'P2',  offset: 0x08 },
+    { label: 'P3',  offset: 0x0C },
+    { label: 'P4',  offset: 0x10 },
+    { label: 'P5',  offset: 0x14 },
+    { label: 'P6',  offset: 0x18 },
+    { label: 'P7',  offset: 0x1C },
+    { label: 'CPU', offset: 0x20 },
+  ];
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  async function readReg(offset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: offset })
+    });
+    if (!res.ok) throw new Error('0x' + offset.toString(16) + ': ' + (res.error || 'failed'));
+    return res.value >>> 0;
+  }
+
+  function bar(pct, color) {
+    return '<div style="flex:1;background:var(--surfAlt);border-radius:3px;height:14px;overflow:hidden;">' +
+      '<div style="width:' + pct.toFixed(1) + '%;height:100%;background:' + color + ';border-radius:3px;transition:width .3s;"></div>' +
+      '</div>';
+  }
+
+  async function readWrRd() {
+    const st   = document.getElementById('rv-st-fabric-wr');
+    const body = document.getElementById('fabricWrBody');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const wrVals = [], rdVals = [];
+      for (const p of PORTS) {
+        wrVals.push(await readReg(WR_BASE + p.offset));
+        rdVals.push(await readReg(RD_BASE + p.offset));
+      }
+
+      const maxWr = Math.max(...wrVals, 1);
+      const maxRd = Math.max(...rdVals, 1);
+
+      body.innerHTML = PORTS.map(function(p, i) {
+        const wrPct = wrVals[i] / maxWr * 100;
+        const rdPct = rdVals[i] / maxRd * 100;
+        return '<div style="display:flex;align-items:center;gap:8px;">' +
+          '<span style="font-size:11px;font-weight:600;width:32px;flex-shrink:0;">' + p.label + '</span>' +
+          '<div style="flex:1;display:flex;flex-direction:column;gap:2px;">' +
+            bar(wrPct, 'var(--accent)') +
+            bar(rdPct, '#44CC77') +
+          '</div>' +
+          '<div style="width:180px;flex-shrink:0;font-size:10px;font-family:var(--mono);display:flex;gap:8px;">' +
+            '<span style="color:var(--accent);width:85px;text-align:right;">W: ' + wrVals[i].toLocaleString() + '</span>' +
+            '<span style="color:#44CC77;width:85px;text-align:right;">R: ' + rdVals[i].toLocaleString() + '</span>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  window._fabricReadWrRd = readWrRd;
+})();
+
+
+
+// ── PORT TX Counters Manager ──────────────────────────────────────────────────
+(function txCntManager() {
+  const SW_REGION = 0x2C0;
+  const TX_BASE   = SW_REGION + 0x400;
+  const PORT_STEP = 0x040;
+
+  const COUNTERS = [
+    { label: 'TRY',      offset: 0x000 },
+    { label: 'PCP 0',    offset: 0x004 },
+    { label: 'PCP 1',    offset: 0x008 },
+    { label: 'PCP 2',    offset: 0x00C },
+    { label: 'PCP 3',    offset: 0x010 },
+    { label: 'PCP 4',    offset: 0x014 },
+    { label: 'PCP 5',    offset: 0x018 },
+    { label: 'PCP 6',    offset: 0x01C },
+    { label: 'PCP 7',    offset: 0x020 },
+    { label: 'Untagged', offset: 0x024 },
+  ];
+
+  const PORT_LABELS = ['P0','P1','P2','P3','P4','P5','P6','P7','CPU'];
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function portBase(port) { return TX_BASE + port * PORT_STEP; }
+
+  function renderPortCard(label, values) {
+    const tryVal = values[0];
+    const pcpVals = values.slice(1);
+    const maxPcp = Math.max(...pcpVals, 1);
+
+    const bars = pcpVals.map(function(v, i) {
+      const pct    = (v / maxPcp * 100).toFixed(1);
+      const pctTry = tryVal > 0 ? (v / tryVal * 100).toFixed(0) : '0';
+      const lbl    = COUNTERS[i + 1].label;
+      return '<div style="display:flex;align-items:center;gap:4px;margin-bottom:2px;">' +
+        '<span style="font-size:9px;width:46px;flex-shrink:0;color:var(--muted);">' + lbl + '</span>' +
+        '<div style="flex:1;background:var(--surf);border-radius:2px;height:10px;overflow:hidden;">' +
+          '<div style="width:' + pct + '%;height:100%;background:var(--accent);opacity:.75;border-radius:2px;"></div>' +
+        '</div>' +
+        '<span class="mono" style="font-size:9px;width:54px;text-align:right;flex-shrink:0;">' + v.toLocaleString() + '</span>' +
+        '<span style="font-size:9px;width:26px;text-align:right;flex-shrink:0;color:var(--muted);">' + pctTry + '%</span>' +
+      '</div>';
+    }).join('');
+
+    return '<div style="background:var(--surfAlt);border:1px solid var(--border);border-radius:6px;padding:8px 10px;">' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">' +
+        '<span style="font-size:12px;font-weight:700;">' + label + '</span>' +
+        '<span class="mono" style="font-size:11px;color:var(--accent);">' + tryVal.toLocaleString() + '</span>' +
+      '</div>' +
+      bars +
+    '</div>';
+  }
+
+  document.getElementById('txCntRead').addEventListener('click', async function() {
+    const st   = document.getElementById('rv-st-tx-cnt');
+    const body = document.getElementById('txCntBody');
+    st.textContent = 'Reading all ports...'; st.style.color = 'var(--muted)';
+    try {
+      const portCards = [];
+      for (let p = 0; p < 9; p++) {
+        const values = [];
+        for (const cnt of COUNTERS) {
+          const res = await api('/api/register/read', {
+            method: 'POST',
+            body: JSON.stringify({ session: getSession(), offset: portBase(p) + cnt.offset })
+          });
+          if (!res.ok) throw new Error(PORT_LABELS[p] + ' ' + cnt.label + ': ' + (res.error || 'failed'));
+          values.push(res.value >>> 0);
+        }
+        portCards.push(renderPortCard(PORT_LABELS[p], values));
+      }
+      body.innerHTML = portCards.join('');
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+// ── TAS Control Manager ───────────────────────────────────────────────────────
+(function tasManager() {
+  const SW_REGION = 0x2C0;
+  const TX_BASE   = SW_REGION + 0x400;
+  const PORT_STEP = 0x040;
+  const NUM_PORTS = 9;
+
+  const OFF = {
+    START:    0x030,
+    BASE_US:  0x034,
+    BASE_SEC: 0x038,
+    LIST_LEN: 0x03C,
+  };
+
+  let currentPort = 0;
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  function portBase(port) { return TX_BASE + port * PORT_STEP; }
+
+  async function regRead(offset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset })
+    });
+    if (!res.ok) throw new Error('0x' + offset.toString(16) + ': ' + (res.error || 'failed'));
+    return res.value >>> 0;
+  }
+
+  async function regWrite(offset, value) {
+    const res = await api('/api/register/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset, value: value >>> 0 })
+    });
+    if (!res.ok) throw new Error('0x' + offset.toString(16) + ': ' + (res.error || 'failed'));
+  }
+
+  // ── BASE TIME hint ────────────────────────────────────────────────────────────
+  function updateHint() {
+    const sec = Number(document.getElementById('tasBaseSec').value) || 0;
+    const us  = Number(document.getElementById('tasBaseUs').value)  || 0;
+    const ms  = sec * 1000 + Math.floor(us / 1000);
+    const dt  = new Date(ms);
+    document.getElementById('tasBaseTimeHint').textContent =
+      isNaN(dt.getTime()) ? '—' : dt.toLocaleString('ko-KR') + '.' + String(us % 1000).padStart(3,'0') + ' ms';
+  }
+
+  document.getElementById('tasBaseSec').addEventListener('input', updateHint);
+  document.getElementById('tasBaseUs').addEventListener('input',  updateHint);
+
+  // ── Now +5s button ────────────────────────────────────────────────────────────
+  document.getElementById('tasFillNow').addEventListener('click', function() {
+    const now = Date.now() + 5000;  // 5초 여유
+    const sec = Math.floor(now / 1000);
+    const us  = (now % 1000) * 1000;
+    document.getElementById('tasBaseSec').value = sec;
+    document.getElementById('tasBaseUs').value  = us;
+    updateHint();
+  });
+
+  // ── Port buttons ──────────────────────────────────────────────────────────────
+  document.querySelectorAll('.tas-port-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.tas-port-btn').forEach(function(b) { b.classList.remove('tas-port-active'); });
+      btn.classList.add('tas-port-active');
+      currentPort = Number(btn.dataset.port);
+    });
+  });
+
+  // ── Read (현재 선택 포트) ──────────────────────────────────────────────────────
+  document.getElementById('tasRead').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-tas');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const base   = portBase(currentPort);
+      const start  = await regRead(base + OFF.START);
+      const baseUs = await regRead(base + OFF.BASE_US);
+      const baseSec= await regRead(base + OFF.BASE_SEC);
+      const listLen= await regRead(base + OFF.LIST_LEN);
+
+      document.getElementById('tasListLen').value  = listLen & 0x3F;
+      document.getElementById('tasBaseSec').value  = baseSec;
+      document.getElementById('tasBaseUs').value   = baseUs & 0xFFFFF;
+      updateHint();
+      updateToggleBtn(start & 0x1);
+
+      st.textContent = 'P' + currentPort + '  START=' + (start & 1) + '  LEN=' + (listLen & 0x3F);
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Apply (현재 선택 포트에 설정값 write) ─────────────────────────────────────
+  document.getElementById('tasApply').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-tas');
+    st.textContent = 'Applying...'; st.style.color = 'var(--muted)';
+    try {
+      const base    = portBase(currentPort);
+      const listLen = Number(document.getElementById('tasListLen').value) & 0x3F;
+      const baseSec = Number(document.getElementById('tasBaseSec').value) >>> 0;
+      const baseUs  = Number(document.getElementById('tasBaseUs').value)  & 0xFFFFF;
+
+      await regWrite(base + OFF.LIST_LEN, listLen);
+      await regWrite(base + OFF.BASE_US,  baseUs);
+      await regWrite(base + OFF.BASE_SEC, baseSec);
+
+      st.textContent = 'P' + currentPort + ' applied'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── Toggle Start / Stop ALL ports ─────────────────────────────────────────────
+  function updateToggleBtn(isRunning) {
+    const btn = document.getElementById('tasToggle');
+    if (isRunning) {
+      btn.textContent = '■ Stop All';
+      btn.classList.add('tas-running');
+      btn.classList.remove('primary');
+    } else {
+      btn.textContent = '▶ Start All';
+      btn.classList.remove('tas-running');
+      btn.classList.remove('primary');
+    }
+  }
+
+  document.getElementById('tasToggle').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-tas');
+    const btn = document.getElementById('tasToggle');
+    // 현재 상태 읽기 (P0 기준)
+    st.textContent = 'Reading state...'; st.style.color = 'var(--muted)';
+    try {
+      const cur = await regRead(portBase(0) + OFF.START);
+      const newVal = (cur & 0x1) ? 0 : 1;
+      const action = newVal ? 'Starting' : 'Stopping';
+      st.textContent = action + ' all ports...'; st.style.color = 'var(--muted)';
+
+      for (let p = 0; p < NUM_PORTS; p++) {
+        await regWrite(portBase(p) + OFF.START, newVal);
+      }
+
+      updateToggleBtn(newVal);
+      st.textContent = (newVal ? '▶ Started' : '■ Stopped') + ' all ports';
+      st.style.color = newVal ? 'var(--green)' : 'var(--muted)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // init
+  updateHint();
+})();
+
+
+
+// ── NIC Manager ───────────────────────────────────────────────────────────────
+(function nicManager() {
+  const NIC_BASE = 0xC00;
+
+  const OFF = {
+    VERSION: 0x000,
+    ENABLE:  0x004,
+    CTRL:    0x010,
+    RAW:     0x014,
+    MASK:    0x018,
+    SW:      0x01C,
+  };
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  async function regRead(offset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase() })
+    });
+    if (!res.ok) throw new Error('+0x' + offset.toString(16) + ': ' + (res.error || 'failed'));
+    return res.value >>> 0;
+  }
+
+  async function regWrite(offset, value) {
+    const res = await api('/api/register/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase(), value: value >>> 0 })
+    });
+    if (!res.ok) throw new Error('+0x' + offset.toString(16) + ': ' + (res.error || 'failed'));
+  }
+
+  // ── VERSION ──────────────────────────────────────────────────────────────────
+  async function readVersion() {
+    const st = document.getElementById('rv-st-nic-ver');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const val   = await regRead(OFF.VERSION);
+      const minor = (val >> 0)  & 0xF;
+      const day   = (val >> 4)  & 0xFF;
+      const month = (val >> 12) & 0xF;
+      const year  = (val >> 16) & 0xFF;
+      const major = (val >> 24) & 0xFF;
+      const monthStr = month <= 9 ? String(month) : month === 0xA ? '10' : month === 0xB ? '11' : '12';
+      document.getElementById('nicVerMajor').textContent = '0x' + major.toString(16).toUpperCase().padStart(2,'0');
+      document.getElementById('nicVerDate').textContent  = '20' + year.toString(16).padStart(2,'0') + '년 ' + monthStr + '월 ' + day.toString(16).padStart(2,'0') + '일';
+      document.getElementById('nicVerMinor').textContent = minor + 'st Edition';
+      document.getElementById('nicVerRaw').textContent   = '0x' + val.toString(16).toUpperCase().padStart(8,'0');
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  // ── ENABLE ───────────────────────────────────────────────────────────────────
+  async function readEnable() {
+    const st = document.getElementById('rv-st-nic-en');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const val = await regRead(OFF.ENABLE);
+      document.getElementById('nicEnable').checked  = !!(val & 0x1);
+      document.getElementById('nicTsAdded').checked = !!(val & 0x2);
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('nicEnableApply').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-en');
+    st.textContent = 'Applying...'; st.style.color = 'var(--muted)';
+    try {
+      const val = (document.getElementById('nicEnable').checked  ? 0x1 : 0) |
+                  (document.getElementById('nicTsAdded').checked ? 0x2 : 0);
+      await regWrite(OFF.ENABLE, val);
+      st.textContent = 'Applied'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── INTERRUPT POLARITY ───────────────────────────────────────────────────────
+  async function readCtrl() {
+    try {
+      const val = await regRead(OFF.CTRL);
+      document.getElementById('nicIntrLow').checked  = !!(val & 0x1);
+      document.getElementById('nicIntrHigh').checked = !(val & 0x1);
+    } catch(e) {}
+  }
+
+  document.getElementById('nicIntrApply').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-intr');
+    st.textContent = 'Applying...'; st.style.color = 'var(--muted)';
+    try {
+      const pol = document.getElementById('nicIntrLow').checked ? 1 : 0;
+      await regWrite(OFF.CTRL, pol);
+      st.textContent = 'Applied — ' + (pol ? 'Active Low' : 'Active High');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── RAW INTERRUPT ─────────────────────────────────────────────────────────────
+  function updateRawDots(val) {
+    const bits = {
+      nicRawTx0: 0, nicRawTx1: 1, nicRawTx2: 2, nicRawTx3: 3,
+      nicRawRx8: 8, nicRawRx9: 9, nicRawSw: 31
+    };
+    Object.entries(bits).forEach(function(entry) {
+      const el = document.getElementById(entry[0]);
+      if (!el) return;
+      if (val & (1 << entry[1])) el.classList.add('active');
+      else el.classList.remove('active');
+    });
+  }
+
+  async function readRaw() {
+    const st = document.getElementById('rv-st-nic-raw');
+    try {
+      const val = await regRead(OFF.RAW);
+      updateRawDots(val);
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = val ? 'var(--green)' : 'var(--muted)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('nicIntrPoll').addEventListener('click', readRaw);
+
+  document.getElementById('nicIntrClearAll').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-raw');
+    st.textContent = 'Clearing...'; st.style.color = 'var(--muted)';
+    try {
+      await regWrite(OFF.RAW, (0xF) | (0x3 << 8) | (1 << 31));
+      await readRaw();
+      st.textContent = 'Cleared'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── INTERRUPT MASK ────────────────────────────────────────────────────────────
+  async function readMask() {
+    const st = document.getElementById('rv-st-nic-mask');
+    try {
+      const val = await regRead(OFF.MASK);
+      document.querySelectorAll('.nic-mask').forEach(function(chk) {
+        chk.checked = !!(val & (1 << Number(chk.dataset.bit)));
+      });
+      st.textContent = '0x' + val.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('nicIntrMaskApply').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-mask');
+    st.textContent = 'Applying...'; st.style.color = 'var(--muted)';
+    try {
+      let mask = 0;
+      document.querySelectorAll('.nic-mask').forEach(function(chk) {
+        if (chk.checked) mask |= (1 << Number(chk.dataset.bit));
+      });
+      await regWrite(OFF.MASK, mask);
+      st.textContent = 'Applied  0x' + mask.toString(16).toUpperCase().padStart(8,'0');
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── SW TRIGGER ────────────────────────────────────────────────────────────────
+  document.getElementById('nicSwTrigger').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-sw');
+    st.textContent = 'Triggering...'; st.style.color = 'var(--muted)';
+    try {
+      await regWrite(OFF.SW, 0x1);
+      st.textContent = 'SW Trigger sent'; st.style.color = 'var(--green)';
+      setTimeout(readRaw, 100);
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+
+  // ── READ ALL ─────────────────────────────────────────────────────────────────
+  document.getElementById('nicReadAll').addEventListener('click', async function() {
+    await readVersion();
+    await readEnable();
+    await readCtrl();
+    await readMask();
+    await readRaw();
+  });
+})();
+
+
+
+// ── NIC TX Manager ────────────────────────────────────────────────────────────
+(function nicTxManager() {
+  const NIC_BASE  = 0xC00;
+  const TX_MEM    = 0x1000;  // TX FIFO 메모리 (BASE + 0x1000)
+  const TX_MAX    = 2048;
+
+  const OFF = {
+    TX_READY:   0x040,
+    TX_AVAIL:   0x044,
+    TX_TRY:     0x050,
+    TX_PKT_ERR: 0x054,
+    TX_MAX_ERR: 0x058,
+    TX_MIN_ERR: 0x05C,
+    TX_SUCC:    0x060,
+  };
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  async function regRead(offset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase() })
+    });
+    if (!res.ok) throw new Error(res.error || 'read failed');
+    return res.value >>> 0;
+  }
+
+  async function regWrite(offset, value) {
+    const res = await api('/api/register/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase(), value: value >>> 0 })
+    });
+    if (!res.ok) throw new Error(res.error || 'write failed');
+  }
+
+  async function memWrite(relOffset, value) {
+    const res = await api('/api/register/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: TX_MEM + relOffset, value: value >>> 0 })
+    });
+    if (!res.ok) throw new Error(res.error || 'mem write failed');
+  }
+
+  function setCounter(id, val, isErr) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = val.toLocaleString();
+    el.style.color = (isErr && val > 0) ? 'var(--red)' : '';
+  }
+
+  // ── 프레임 길이 실시간 표시 ───────────────────────────────────────────────────
+  document.getElementById('nicTxFrameData').addEventListener('input', function() {
+    const bytes = this.value.trim().split(/\s+/).filter(function(h) { return h.length > 0; });
+    const lenEl = document.getElementById('nicTxFrameLen');
+    if (lenEl) lenEl.textContent = bytes.length + ' bytes';
+  });
+
+  // ── Read (AVAIL + 카운터) ─────────────────────────────────────────────────────
+  async function readAll() {
+    const st = document.getElementById('rv-st-nic-tx');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      const avail = (await regRead(OFF.TX_AVAIL)) & 0xFFF;
+      const pct   = (avail / TX_MAX * 100).toFixed(1);
+      document.getElementById('nicTxAvailVal').textContent = avail + ' / ' + TX_MAX + ' bytes  (' + pct + '%)';
+      const bar = document.getElementById('nicTxAvailBar');
+      bar.style.width = pct + '%';
+      bar.style.background = avail < 256 ? 'var(--red)' : avail < 512 ? '#F59E0B' : 'var(--green)';
+
+      const tryVal  = await regRead(OFF.TX_TRY);
+      const pktErr  = await regRead(OFF.TX_PKT_ERR);
+      const maxErr  = await regRead(OFF.TX_MAX_ERR);
+      const minErr  = await regRead(OFF.TX_MIN_ERR);
+      const succVal = await regRead(OFF.TX_SUCC);
+
+      setCounter('nicTxTry',    tryVal,  false);
+      setCounter('nicTxSucc',   succVal, false);
+      setCounter('nicTxPktErr', pktErr,  true);
+      setCounter('nicTxMaxErr', maxErr,  true);
+      setCounter('nicTxMinErr', minErr,  true);
+
+      const sumEl = document.getElementById('nicTxSummary');
+      if (sumEl) {
+        const succPct  = tryVal > 0 ? (succVal / tryVal * 100).toFixed(1) : '—';
+        const errTotal = pktErr + maxErr + minErr;
+        sumEl.textContent = 'TRY ' + tryVal.toLocaleString() +
+          '  →  SUCCESS ' + succVal.toLocaleString() + ' (' + succPct + '%)' +
+          (errTotal > 0 ? '  |  에러: PKT ' + pktErr + '  MAX ' + maxErr + '  MIN ' + minErr : '  |  에러 없음');
+        sumEl.style.color = errTotal > 0 ? 'var(--red)' : 'var(--green)';
+      }
+      st.textContent = 'OK'; st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('nicTxAvailRead').addEventListener('click', readAll);
+
+  // ── Send ──────────────────────────────────────────────────────────────────────
+  document.getElementById('nicTxSend').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-tx');
+    const hexStr = document.getElementById('nicTxFrameData').value.trim();
+    const hexArr = hexStr.split(/\s+/).filter(function(h) { return h.length > 0; });
+
+    if (hexArr.length === 0) { st.textContent = '프레임 데이터를 입력하세요'; st.style.color = 'var(--muted)'; return; }
+
+    // byte 배열로 변환
+    const bytes = hexArr.map(function(h) { return parseInt(h, 16); });
+    if (bytes.some(isNaN)) { st.textContent = '올바른 Hex 값을 입력하세요 (예: FF 00 11 ...)'; st.style.color = 'var(--red)'; return; }
+
+    const byteLen = bytes.length;
+
+    st.textContent = 'Checking AVAIL...'; st.style.color = 'var(--muted)';
+    try {
+      // 1. AVAIL 확인 (헤더 1워드 + 데이터 워드 포함)
+      const wordsNeeded = 1 + Math.ceil(byteLen / 4);  // header + data
+      const avail = (await regRead(OFF.TX_AVAIL)) & 0xFFF;
+      if (avail < wordsNeeded * 4) {
+        st.textContent = 'TX 메모리 부족: ' + avail + 'bytes 남음, ' + (wordsNeeded * 4) + 'bytes 필요';
+        st.style.color = 'var(--red)'; return;
+      }
+
+      st.textContent = 'Writing to TX memory...'; st.style.color = 'var(--muted)';
+
+      // 2. 헤더 워드 write: [10:0]=Length(bytes)
+      await memWrite(0, byteLen & 0x7FF);
+
+      // 3. 데이터 워드 write (4바이트씩)
+      for (let i = 0; i < byteLen; i += 4) {
+        const w = ((bytes[i]   || 0) << 24) |
+                  ((bytes[i+1] || 0) << 16) |
+                  ((bytes[i+2] || 0) << 8)  |
+                   (bytes[i+3] || 0);
+        await memWrite(0, w >>> 0);
+      }
+
+      // 4. TX_READY = 1
+      st.textContent = 'TX Ready...'; st.style.color = 'var(--muted)';
+      await regWrite(OFF.TX_READY, 0x1);
+
+      st.textContent = 'Sent ' + byteLen + ' bytes (' + wordsNeeded + ' words)';
+      st.style.color = 'var(--green)';
+      setTimeout(readAll, 300);
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();
+
+
+// ── NIC RX Manager ────────────────────────────────────────────────────────────
+(function nicRxManager() {
+  const NIC_BASE = 0xC00;
+  const RX_MEM   = 0x2000;  // RX FIFO 메모리 (BASE + 0x2000)
+
+  const OFF = {
+    RX_FRAME_INFO: 0x080,
+    RX_INTR_INFO:  0x084,
+    RX_TRY:        0x090,
+    RX_FCS_ERR:    0x094,
+    RX_LEN_FAIL:   0x098,
+    RX_MEM_FULL:   0x09C,
+    RX_SUCC:       0x0A0,
+  };
+
+  function getSession() {
+    const el = document.getElementById('serialPort');
+    return el ? el.value : '';
+  }
+
+  async function regRead(offset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase() })
+    });
+    if (!res.ok) throw new Error(res.error || 'read failed');
+    return res.value >>> 0;
+  }
+
+  async function regWrite(offset, value) {
+    const res = await api('/api/register/write', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: '0x' + (NIC_BASE + offset).toString(16).toUpperCase(), value: value >>> 0 })
+    });
+    if (!res.ok) throw new Error(res.error || 'write failed');
+  }
+
+  async function memRead(relOffset) {
+    const res = await api('/api/register/read', {
+      method: 'POST',
+      body: JSON.stringify({ session: getSession(), offset: RX_MEM + relOffset })
+    });
+    if (!res.ok) throw new Error(res.error || 'mem read failed');
+    return res.value >>> 0;
+  }
+
+  function setDot(id, active) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (active) el.classList.add('active'); else el.classList.remove('active');
+  }
+
+  function setCounter(id, val, isErr) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = val.toLocaleString();
+    el.style.color = (isErr && val > 0) ? 'var(--red)' : '';
+  }
+
+  function toHex8(v) { return (v >>> 0).toString(16).toUpperCase().padStart(8, '0'); }
+
+  // ── Read All (Frame Info + Intr Info + RX Memory + Counters) ─────────────────
+  async function readAll() {
+    const st = document.getElementById('rv-st-nic-rx');
+    st.textContent = 'Reading...'; st.style.color = 'var(--muted)';
+    try {
+      // Frame Info
+      const frameInfo = await regRead(OFF.RX_FRAME_INFO);
+      const wordLen   = frameInfo & 0x1FF;
+      const frameNum  = (frameInfo >> 12) & 0x7F;
+      document.getElementById('nicRxWordLen').textContent  = wordLen + ' words (' + (wordLen * 4) + ' bytes)';
+      document.getElementById('nicRxFrameNum').textContent = frameNum + ' frames';
+
+      // Intr Info
+      const intrInfo = await regRead(OFF.RX_INTR_INFO);
+      const rxLen    = intrInfo & 0x7FF;
+      const fcsErr   = !!(intrInfo & (1 << 12));
+      const memFull  = !!(intrInfo & (1 << 13));
+      document.getElementById('nicRxLength').textContent = rxLen + ' bytes';
+      setDot('nicRxFcsErr',  fcsErr);
+      setDot('nicRxMemFull', memFull);
+
+      // RX Memory 읽기 (wordLen 워드만큼)
+      const frameEl = document.getElementById('nicRxFrameData');
+      if (wordLen > 0) {
+        const words = [];
+        for (let i = 0; i < wordLen; i++) {
+          words.push(await memRead(0));
+        }
+        // 첫 워드: Switch Packet Header 파싱
+        const hdr        = words[0];
+        const hdrLen     = hdr & 0x7FF;
+        const hdrTsAdded = !!(hdr & (1 << 12));
+        const hdrFrmCnt  = (hdr >> 16) & 0xFFFF;
+
+        let out = '[Header] Length=' + hdrLen + 'B  TS_ADDED=' + (hdrTsAdded ? 'Y' : 'N') + '  Frame_count=' + hdrFrmCnt + '\n';
+        out += '[Data]\n';
+        // 나머지 워드를 hex + ASCII로 표시
+        for (let i = 1; i < words.length; i++) {
+          const w = words[i];
+          const b = [(w>>24)&0xFF,(w>>16)&0xFF,(w>>8)&0xFF,w&0xFF];
+          const hex = b.map(function(x){return x.toString(16).toUpperCase().padStart(2,'0');}).join(' ');
+          const asc = b.map(function(x){return x>=32&&x<127?String.fromCharCode(x):'.';}).join('');
+          out += hex + '  ' + asc + '\n';
+        }
+        frameEl.textContent = out;
+        frameEl.style.color = 'var(--fg)';
+      } else {
+        frameEl.textContent = '수신 데이터 없음 (wordLen=0)';
+        frameEl.style.color = 'var(--muted)';
+      }
+
+      // Counters
+      const tryVal   = await regRead(OFF.RX_TRY);
+      const fcsErrC  = await regRead(OFF.RX_FCS_ERR);
+      const lenFail  = await regRead(OFF.RX_LEN_FAIL);
+      const memFullC = await regRead(OFF.RX_MEM_FULL);
+      const succVal  = await regRead(OFF.RX_SUCC);
+
+      setCounter('nicRxTry',       tryVal,  false);
+      setCounter('nicRxSucc',      succVal, false);
+      setCounter('nicRxFcsErrCnt', fcsErrC, true);
+      setCounter('nicRxLenFail',   lenFail, true);
+      setCounter('nicRxMemFullCnt',memFullC,true);
+
+      const sumEl = document.getElementById('nicRxSummary');
+      if (sumEl) {
+        const succPct  = tryVal > 0 ? (succVal / tryVal * 100).toFixed(1) : '—';
+        const errTotal = fcsErrC + lenFail + memFullC;
+        sumEl.textContent = 'TRY ' + tryVal.toLocaleString() +
+          '  →  SUCCESS ' + succVal.toLocaleString() + ' (' + succPct + '%)' +
+          (errTotal > 0 ? '  |  에러: FCS ' + fcsErrC + '  LEN ' + lenFail + '  MEM ' + memFullC : '  |  에러 없음');
+        sumEl.style.color = errTotal > 0 ? 'var(--red)' : 'var(--green)';
+      }
+
+      st.textContent = 'OK  wordLen=' + wordLen + '  frameNum=' + frameNum;
+      st.style.color = 'var(--green)';
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  }
+
+  document.getElementById('nicRxRead').addEventListener('click', readAll);
+
+  // ── Next Frame ────────────────────────────────────────────────────────────────
+  document.getElementById('nicRxNext').addEventListener('click', async function() {
+    const st = document.getElementById('rv-st-nic-rx');
+    st.textContent = 'Next frame...'; st.style.color = 'var(--muted)';
+    try {
+      await regWrite(OFF.RX_FRAME_INFO, 0x0);
+      setTimeout(readAll, 100);
+    } catch(e) { st.textContent = e.message; st.style.color = 'var(--red)'; }
+  });
+})();

@@ -214,6 +214,7 @@ app.use('/api', require('./routes/counter'));
 app.use('/api', require('./routes/timestamp'));
 app.use('/api', require('./routes/auto'));
 app.use('/api', require('./routes/portmap'));
+app.use('/api', require('./routes/table'));
 
 // ── reports static ───────────────────────────────────────────────────────────
 app.use('/reports', express.static(reportsDir));

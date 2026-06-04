@@ -88,6 +88,7 @@ function scanCsvFiles(dir, base) {
   const result = [];
   if (!fs.existsSync(dir)) return result;
   for (const entry of fs.readdirSync(dir)) {
+    if (entry.startsWith('~$')) continue;
     const full = path.join(dir, entry);
     const rel  = base ? `${base}/${entry}` : entry;
     if (fs.statSync(full).isDirectory()) {
@@ -99,15 +100,59 @@ function scanCsvFiles(dir, base) {
   return result;
 }
 
+// CSV 파일의 첫 데이터 행에서 { scenarioId, tcId } 반환
+function _getFileSortKey(filePath) {
+  try {
+    const rows = parseCsvRows(readCsvText(filePath));
+    const r = rows[0] || {};
+    const sid = parseInt(r['Test_Scenario_ID'] || r['Scenario_ID'] || 'Infinity');
+    const tid = parseInt(r['TC_ID'] || r['TC_Id'] || 'Infinity');
+    return { sid: isFinite(sid) ? sid : Infinity, tid: isFinite(tid) ? tid : Infinity };
+  } catch { return { sid: Infinity, tid: Infinity }; }
+}
+
+// 폴더 내 CSV 파일들의 최소 Test_Scenario_ID를 반환 (정렬 기준용)
+function _minScenarioIdInDir(dir) {
+  let min = Infinity;
+  try {
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.endsWith('.csv') || entry.startsWith('~$')) continue;
+      const { sid } = _getFileSortKey(path.join(dir, entry));
+      if (sid < min) min = sid;
+    }
+  } catch { /* ignore */ }
+  return isFinite(min) ? min : Infinity;
+}
+
 function buildCsvTree(dir, base) {
   const result = [];
   if (!fs.existsSync(dir)) return result;
-  for (const entry of fs.readdirSync(dir).sort()) {
+
+  const entries = fs.readdirSync(dir).filter(e => !e.startsWith('~$'));
+
+  const dirs  = entries.filter(e => fs.statSync(path.join(dir, e)).isDirectory());
+  const files = entries.filter(e => !fs.statSync(path.join(dir, e)).isDirectory() && e.endsWith('.csv'));
+
+  // 폴더: Scenario_ID 기준 정렬
+  dirs.sort((a, b) => {
+    const sidA = _minScenarioIdInDir(path.join(dir, a));
+    const sidB = _minScenarioIdInDir(path.join(dir, b));
+    return (sidA - sidB) || a.localeCompare(b);
+  });
+
+  // 파일: Scenario_ID → TC_ID 기준 정렬
+  files.sort((a, b) => {
+    const kA = _getFileSortKey(path.join(dir, a));
+    const kB = _getFileSortKey(path.join(dir, b));
+    return (kA.sid - kB.sid) || (kA.tid - kB.tid) || a.localeCompare(b);
+  });
+
+  for (const entry of [...dirs, ...files]) {
     const full = path.join(dir, entry);
     const rel  = base ? `${base}/${entry}` : entry;
     if (fs.statSync(full).isDirectory()) {
       result.push({ type: 'dir', name: entry, path: rel, children: buildCsvTree(full, rel) });
-    } else if (entry.endsWith('.csv')) {
+    } else {
       result.push({ type: 'file', name: entry, path: rel, isPacket: entry.toLowerCase().includes('packet') });
     }
   }
@@ -186,6 +231,24 @@ function buildGroupsFromCsvs(all) {
 router.get('/testcases/csv-tree', (req, res) => {
   try { res.json({ ok: true, tree: buildCsvTree(scenariosDir, '') }); }
   catch (e) { wErr(res, e); }
+});
+
+// CSV 파일에서 직접 읽어 Test_Scenario_ID → TC_ID 순 정렬된 그룹 반환
+router.get('/testcases/sorted-groups', (req, res) => {
+  console.log('[sorted-groups] called');
+  try {
+    const all = scanCsvFiles(scenariosDir, '');
+    console.log('[sorted-groups] scanned files:', all);
+    const groups = buildGroupsFromCsvs(all);
+    groups.forEach(g => {
+      const ids = (g.cases || []).map(c => c.testScenarioId);
+      console.log(`[sorted-groups] folder="${g.name}" ids=${JSON.stringify(ids)} min=${Math.min(...ids)}`);
+    });
+    res.json({ ok: true, groups });
+  } catch (e) {
+    console.error('[sorted-groups] ERROR:', e);
+    wErr(res, e);
+  }
 });
 
 router.get('/testcases/scan-scenarios', (req, res) => {
@@ -369,6 +432,37 @@ router.post('/sequence/events/clear', async (req, res) => {
 router.get('/ports/link-status', async (req, res) => {
   try {
     return res.redirect(307, '/api/mdio/link-status');
+  } catch (e) { wErr(res, e); }
+});
+
+// ── POST /api/testcases/branch-rows ──────────────────────────────────────────
+// body: { scenarioId, tcId, groupId? }
+// Loads TC_Branch.csv and returns rows matching scenarioId + tcId (+ groupId if provided)
+router.post('/testcases/branch-rows', (req, res) => {
+  try {
+    const { scenarioId, tcId, groupId } = req.body || {};
+
+    const full = path.join(scenariosDir, 'TC_Branch.csv');
+    if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: 'TC_Branch.csv not found' });
+
+    const rows = parseCsvRows(readCsvText(full));
+    const filtered = rows.filter(r => {
+      const sid = String(r['Test_Scenario_ID'] || r['Scenario_ID'] || '').trim();
+      const tid = String(r['TC_ID'] || '').trim();
+      const gid = String(r['GroupID'] || r['groupId'] || '').trim().toLowerCase();
+      const matchSid   = !scenarioId || sid === String(scenarioId);
+      const matchTid   = !tcId      || tid === String(tcId);
+      const matchGroup = !groupId   || gid === String(groupId).toLowerCase();
+      return matchSid && matchTid && matchGroup;
+    });
+
+    filtered.sort((a, b) => {
+      const ia = parseInt(a['Index'] || a['index'] || '0') || 0;
+      const ib = parseInt(b['Index'] || b['index'] || '0') || 0;
+      return ia - ib;
+    });
+
+    res.json({ ok: true, rows: filtered, count: filtered.length });
   } catch (e) { wErr(res, e); }
 });
 

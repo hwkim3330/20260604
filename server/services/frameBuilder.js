@@ -237,7 +237,15 @@ function buildFrameFromBlocks(blocks, profile, seq) {
         // VLAN contributes 4 bytes: TCI (2) + inner EtherType (2)
         // The TPID 0x8100 is in the preceding Ethernet block's etherType field
         const tci = ((block.priority ?? 0) << 13) | ((block.dei ? 1 : 0) << 12) | ((block.vlanId ?? 1) & 0xFFF);
-        parts.push(Buffer.concat([u16be(tci), u16be(parseHex(block.innerEtherType ?? '0x0800'))]));
+        // inner EtherType: 명시된 값 우선, 없으면 다음 블록 타입으로 자동 결정
+        let innerEt = parseHex(block.innerEtherType || '0');
+        if (!innerEt) {
+          if      (nextType === 'ARP')  innerEt = 0x0806;
+          else if (nextType === 'IPv4') innerEt = 0x0800;
+          else if (nextType === 'IPv6') innerEt = 0x86DD;
+          else                          innerEt = 0x0800;
+        }
+        parts.push(Buffer.concat([u16be(tci), u16be(innerEt)]));
         break;
       }
       case 'IPv4': {

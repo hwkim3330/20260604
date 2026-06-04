@@ -205,8 +205,8 @@ function hasTcpdump() {
 // ── Unified startCapture ───────────────────────────────────────────────────────
 
 function startCapture(ifaceNames, filter, onPacket, onError) {
-  // Auto-build BPF filter from interface MACs when none is provided
-  const effectiveFilter = filter || (ifaceNames.length ? buildIfaceBpfFilter(ifaceNames) : '');
+  // filter=''(promisc)이면 BPF 필터 미적용, null/undefined일 때만 MAC 기반 필터 자동 생성
+  const effectiveFilter = filter ?? (ifaceNames.length ? buildIfaceBpfFilter(ifaceNames) : '');
 
   if (Cap) {
     // Primary: cap npm

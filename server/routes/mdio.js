@@ -131,17 +131,37 @@ router.get('/mdio/link-status', async (req, res) => {
       const acc     = blockBase(port) + OFF_ACC;
       const cmd     = 0x80000000 | ((phyAddr & 0x1F) << 21) | ((0x01) << 16);
 
-      // First read — clears latch
-      const first = await readBmsr(acc, cmd);
-      if (first === null) { ports.push({ port, linkUp: null }); continue; }
+      // Read SETUP and TIME registers first — these are plain AHB reads,
+      // independent of MDIO enable state, so they must run before readBmsr
+      // which may timeout (and continue) for disabled/inactive ports.
+      let setup = null;
+      try {
+        const setupOff = blockBase(port) + OFF_SETUP;
+        const timeOff  = blockBase(port) + OFF_TIME;
+        const setupVal = await regRead(req, setupOff);
+        const timeVal  = await regRead(req, timeOff);
 
-      // Second read — actual current link state
+        const enable     = Boolean(setupVal & 0x00010000);
+        const preDisable = Boolean(setupVal & 0x01000000);
+        const intrEnable = Boolean(setupVal & 0x80000000);
+        const clk        = timeVal & 0xFF;
+        const ms         = (timeVal >>> 8) & 0xFFF;
+        const unit       = (timeVal >>> 20) & 0xFFF;
+        const targetMhz  = ms > 0 ? parseFloat((ms / 1000).toFixed(3)) : 2.5;
+        setup = { enable, preDisable, intrEnable, clk, ms, unit, targetMhz };
+      } catch (e) { console.warn(`[mdio] setup read port ${port}: ${e.message}`); }
+
+      // First BMSR read — clears latch
+      const first = await readBmsr(acc, cmd);
+      if (first === null) { ports.push({ port, linkUp: null, setup }); continue; }
+
+      // Second BMSR read — actual current link state
       const second = await readBmsr(acc, cmd);
-      if (second === null) { ports.push({ port, linkUp: null }); continue; }
+      if (second === null) { ports.push({ port, linkUp: null, setup }); continue; }
 
       // 0xFFFF: no PHY responded (bus pulled high) → no link
       const linkUp = second === 0xFFFF ? false : Boolean(second & 0x0004);
-      ports.push({ port, linkUp });
+      ports.push({ port, linkUp, setup });
     }
     res.json({ ok: true, ports });
   } catch (e) { wErr(res, e); }
