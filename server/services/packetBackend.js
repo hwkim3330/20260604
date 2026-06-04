@@ -151,8 +151,12 @@ function startCaptureTcpdump(ifaceNames, filter, onPacket, onError) {
 
         // Suppress tcpdump echo of our own injected TX frames
         const txKey = iface + hexStr;
-        if (_recentTxHexes.has(txKey)) {
-          if (_recentTxHexes.get(txKey) > Date.now()) { _recentTxHexes.delete(txKey); continue; }
+        const txEcho = _recentTxHexes.get(txKey);
+        if (txEcho) {
+          if (txEcho.exp > Date.now() && txEcho.n > 0) {
+            if (--txEcho.n <= 0) _recentTxHexes.delete(txKey);
+            continue; // echo of a frame already recorded as TX
+          }
           _recentTxHexes.delete(txKey);
         }
 
@@ -230,10 +234,11 @@ function startCapture(ifaceNames, filter, onPacket, onError) {
             const hexStr = frame.toString('hex');
             // Suppress libpcap echo of our own injected TX frames
             const txKey = dev + hexStr;
-            if (_recentTxHexes.has(txKey)) {
-              if (_recentTxHexes.get(txKey) > Date.now()) {
-                _recentTxHexes.delete(txKey);
-                return; // already recorded as TX
+            const txEcho = _recentTxHexes.get(txKey);
+            if (txEcho) {
+              if (txEcho.exp > Date.now() && txEcho.n > 0) {
+                if (--txEcho.n <= 0) _recentTxHexes.delete(txKey);
+                return; // echo of a frame already recorded as TX
               }
               _recentTxHexes.delete(txKey);
             }
@@ -477,14 +482,29 @@ function buildIfaceBpfFilter(ifaceNames) {
 
 function clearCapture() { captureSeq = 0; captureRows = []; _recentTxHexes.clear(); }
 
-// Dedup set: TX frames registered here are suppressed once if libpcap also captures them
-const _recentTxHexes = new Map(); // key: dev+hex → expiry timestamp
+// Dedup set: TX frames registered here are suppressed if libpcap also echoes them back.
+// Value is { exp, n } — n counts how many identical TX copies are still awaiting an echo,
+// so bursts (count>1) of identical frames (e.g. ARP/raw) suppress every echo, not just the first.
+const _recentTxHexes = new Map(); // key: dev+hex → { exp: expiryMs, n: outstanding copies }
+
+// Drop entries whose echo never arrived (common when libpcap doesn't capture outbound).
+// Called opportunistically so the Map can't grow without bound during long bursts.
+function _pruneTxHexes(now) {
+  for (const [k, v] of _recentTxHexes) {
+    if (v.exp <= now) _recentTxHexes.delete(k);
+  }
+}
 
 function _recordTxFrame(dev, frame) {
   const hexStr = frame.toString('hex');
   const key    = dev + hexStr;
-  // Register for dedup (suppress one libpcap echo within 300ms)
-  _recentTxHexes.set(key, Date.now() + 300);
+  // Register for dedup (suppress libpcap echoes within 300ms). Accumulate the count so
+  // every copy of an identical burst is matched, then refresh the expiry window.
+  const now  = Date.now();
+  const prev = _recentTxHexes.get(key);
+  const n    = (prev && prev.exp > now ? prev.n : 0) + 1;
+  _recentTxHexes.set(key, { exp: now + 300, n });
+  if (_recentTxHexes.size > 4096) _pruneTxHexes(now);
   // Add to capture buffer as TX
   const no      = ++captureSeq;
   const ts      = Date.now() / 1000;
