@@ -2247,6 +2247,9 @@ const EVENT_FIELDS = {
                    { id:'expected',         label:'Expected MAC',     type:'text',   def:'' },
                    { id:'expectedStatic',   label:'Expected Type (static/dynamic, 빈값=검증안함)', type:'text', def:'' }],
   FdbInitialize:    [],
+  // Packet은 FrameRef로 패킷 리스트의 정의를 참조 — 드롭다운에서 선택 (오타 방지)
+  Packet:           [{ id:'frameRef',  label:'Packet (FrameRef)', type:'select',
+                       options: () => getActivePackets().map(p => p.name) }],
   RxVerify:         [{ id:'expected',  label:'Expected (port bitmask)', type:'text', def:'0b000001' },
                      { id:'timeoutMs', label:'Timeout',                 type:'text', def:'1000ms'   }],
   RxCapture:        [{ id:'timeoutMs', label:'Timeout',                 type:'text', def:'1000ms'   }],
@@ -2264,7 +2267,7 @@ const EVENT_API_TYPE = {
   Delay:'delay', RegWrite:'regwrite', RegRead:'regread', RegVerify:'regverify',
   FdbWrite:'fdbwrite', FdbWriteBucket:'fdbwritebucket', FdbRead:'fdbread', FdbReadBucket:'fdbreadbucket',
   FdbVerify:'fdbverify', FdbInitialize:'fdbinitialize', RxVerify:'rxverify', RxCapture:'rxcapture',
-  BranchTo:'branchto', Break:'break',
+  BranchTo:'branchto', Break:'break', Packet:'packet',
 };
 
 // Reverse map: lowercased API-type string → EVENT_FIELDS kind key
@@ -2279,6 +2282,8 @@ const EVENT_KIND_BY_API_TYPE = (() => {
   m['fdbflush']       = 'FdbInitialize';
   m['branchto'] = 'BranchTo';
   m['break']    = 'Break';
+  m['sendpacket'] = 'Packet';
+  m['send']       = 'Packet';
   return m;
 })();
 
@@ -2300,6 +2305,7 @@ function getRowField(row, fieldId) {
     mask:             ['Mask'],
     timeoutMs:        ['Timeout', 'timeout'],
     delayMs:          ['Timeout', 'timeout', 'DelayMs'],
+    frameRef:         ['FrameRef', 'frameref'],
     captureInterface: ['CaptureInterface'],
     captureFilter:    ['CaptureFilter', 'Filter'],
     captureExpected:  ['CaptureExpected'],
@@ -2344,6 +2350,10 @@ function showEventEditorForRow(row, rowIdx) {
         el.checked = s === '1' || s === 'y' || s === 'yes' || s === 'true' || val === true;
       } else {
         el.value = val;
+        // select에 저장값이 옵션에 없으면(패킷 삭제됨 등) 추가해서 보존
+        if (el.tagName === 'SELECT' && el.value !== String(val)) {
+          el.insertAdjacentHTML('beforeend', `<option value="${esc(String(val))}" selected>${esc(String(val))} (목록에 없음)</option>`);
+        }
       }
     }
   }
@@ -2372,6 +2382,7 @@ function updateRowFromEditor() {
   const kind = btn?.dataset.evKind;
   const rowIdx = parseInt(btn?.dataset.editRowIdx ?? '-1');
   if (!kind || rowIdx < 0) return;
+  if (kind === 'Packet' && !$('eef-frameRef')?.value) return toast('패킷(FrameRef)을 선택하세요', 'warn');
 
   if (state.seqRenderMode === 'tc') {
     const rows = state.seqItems;
@@ -2391,7 +2402,7 @@ function updateRowFromEditor() {
     const toCSV = {
       address: 'Address', value: 'Value', mac: 'MAC', vlanId: 'VlanID', vlanValid: 'VlanValid', port: 'Port',
       bucket: 'Bucket', slot: 'Slot', expected: 'Expected', mask: 'Mask',
-      timeoutMs: 'Timeout', delayMs: 'Timeout',
+      timeoutMs: 'Timeout', delayMs: 'Timeout', frameRef: 'FrameRef',
       captureInterface: 'CaptureInterface', captureFilter: 'CaptureFilter', captureExpected: 'CaptureExpected',
       expectedPort: 'ExpectedPort', expectedAbsent: 'ExpectedAbsent',
       gotoIndex: 'GotoIndex', gotoScenarioId: 'GotoScenarioID', gotoTcId: 'GotoTC_ID',
@@ -2428,6 +2439,12 @@ function showEventEditor(kind) {
             i++;
           } else if (f.type === 'checkbox') {
             out.push(`<div class="field"><label>${esc(f.label)}</label><input id="eef-${f.id}" type="checkbox"${f.def ? ' checked' : ''}></div>`);
+          } else if (f.type === 'select') {
+            const opts = typeof f.options === 'function' ? f.options() : (f.options || []);
+            out.push(`<div class="field"><label>${esc(f.label)}</label><select id="eef-${f.id}">` +
+              `<option value="">— 선택 —</option>` +
+              opts.map(o => `<option value="${esc(o)}">${esc(o)}</option>`).join('') +
+              `</select></div>`);
           } else {
             out.push(`<div class="field"><label>${esc(f.label)}</label><input id="eef-${f.id}" type="${f.type}" value="${esc(String(f.def))}" placeholder="${esc(f.label)}"></div>`);
           }
@@ -2449,13 +2466,14 @@ async function addEventFromEditor() {
   const btn = $('addToSequence');
   const kind = btn?.dataset.evKind;
   if (!kind) return;
+  if (kind === 'Packet' && !$('eef-frameRef')?.value) return toast('패킷(FrameRef)을 선택하세요', 'warn');
 
   // CSV 모드: 서버 API 대신 로컬 시퀀스에 직접 추가 (renderSequenceRows 호출 방지)
   if (state.selectedCsvPath || state.tcSeqList.length) {
     const toCSV = {
       address:'Address', value:'Value', mac:'MAC', vlanId:'VlanID', vlanValid:'VlanValid', port:'Port',
       bucket:'Bucket', slot:'Slot', expected:'Expected', expectedStatic:'ExpectedStatic', mask:'Mask',
-      timeoutMs:'Timeout', delayMs:'Timeout',
+      timeoutMs:'Timeout', delayMs:'Timeout', frameRef:'FrameRef',
       captureInterface:'CaptureInterface', captureFilter:'CaptureFilter', captureExpected:'CaptureExpected',
       gotoIndex:'GotoIndex', gotoScenarioId:'GotoScenarioID', gotoTcId:'GotoTC_ID',
       gotoValue:'GotoValue', maxIterations:'MaxIterations',

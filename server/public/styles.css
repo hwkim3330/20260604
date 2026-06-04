@@ -574,6 +574,7 @@ tbody tr.selected { background: var(--sel) !important; }
 .ev-pal-regverify    { background: #2A1A55; border-color: #6644AA; }
 .ev-pal-fdb          { background: #1A3A2A; border-color: #226644; }
 .ev-pal-fdbinitialize{ background: #3A1A1A; border-color: #AA3333; }
+.ev-pal-packet       { background: #4A3A1A; border-color: #CC9933; }
 .ev-pal-rxverify     { background: #1A2A3A; border-color: #3377AA; }
 .ev-pal-rxcapture    { background: #1A2A3A; border-color: #3377AA; }
 .ev-pal-branch       { background: #5A1A3A; border-color: #FF88BB; }
