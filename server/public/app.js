@@ -5491,6 +5491,10 @@ init();
 initApp();
 
 // ── Port Mapping ──────────────────────────────────────────────────────────────
+// Number of switch ports shown in the Settings → Port Mapping table.
+// 6 base ports + 2 extra 10G local interfaces = 8.
+const PM_PORTS = 8;
+
 async function loadPortMap() {
   const st = $('portmapSt');
   try {
@@ -5508,7 +5512,7 @@ async function loadPortMap() {
     if (!tbody) return;
     tbody.innerHTML = '';
 
-    for (let p = 0; p < 6; p++) {
+    for (let p = 0; p < PM_PORTS; p++) {
       const saved    = portmap.find(e => e.port === p) || { port: p, iface: '' };
       const isRemote = !!saved.nodeUrl;
       const ifacePool = isRemote ? state.portmapRemoteIfaces : state.interfaces;
@@ -5562,7 +5566,7 @@ async function _probePortMapBSilent(url) {
     const { interfaces = [] } = await resp.json();
     state.portmapRemoteIfaces = interfaces;
     buildAllIfaces();  // rebuild scenario selects with fresh remote ifaces
-    for (let p = 0; p < 6; p++) {
+    for (let p = 0; p < PM_PORTS; p++) {
       const sel = $(`pmIface${p}`);
       if (!sel || sel.dataset.remote !== 'true') continue;
       const current = sel.value;
@@ -5589,7 +5593,7 @@ async function probePortMapB() {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const { interfaces = [] } = await resp.json();
     state.portmapRemoteIfaces = interfaces;
-    for (let p = 0; p < 6; p++) {
+    for (let p = 0; p < PM_PORTS; p++) {
       const sel = $(`pmIface${p}`);
       if (!sel || sel.dataset.remote !== 'true') continue;
       const current = sel.value;
@@ -5611,7 +5615,7 @@ async function probePortMapB() {
 async function savePortMap() {
   const nodeBUrl = $('portmapNodeBUrl')?.value?.trim() || '';
   const portmap = [];
-  for (let p = 0; p < 6; p++) {
+  for (let p = 0; p < PM_PORTS; p++) {
     const sel = $(`pmIface${p}`);
     const isRemote = sel?.dataset.remote === 'true';
     const entry = { port: p, iface: sel?.value || '' };

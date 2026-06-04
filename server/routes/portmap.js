@@ -13,6 +13,8 @@ const DEFAULT_MAP  = [
   { port: 3, iface: 'enp12s0f3' },
   { port: 4, iface: 'enp3s0f1', nodeUrl: REMOTE_URL },   // 192.168.1.244
   { port: 5, iface: 'enp3s0f0', nodeUrl: REMOTE_URL },   // 192.168.1.254
+  { port: 6, iface: '' },   // extra 10G local — set in Settings → Port Mapping
+  { port: 7, iface: '' },   // extra 10G local — set in Settings → Port Mapping
 ];
 
 router.get('/portmap', (_req, res) => {
