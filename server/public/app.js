@@ -5336,6 +5336,12 @@ async function init() {
   $('benchMxStop')?.addEventListener('click', () => { _benchMxAbort = true; });
   $('benchMxExportReport')?.addEventListener('click', exportMatrixBenchReport);
 
+  // 10G line-rate test (pktgen)
+  $('pgtgRun')?.addEventListener('click', runPktgenTest);
+  $('pgtgStop')?.addEventListener('click', stopPktgenTest);
+  $('pgtgMode')?.addEventListener('change', _pgtgModeChange);
+  initPktgenPanel();
+
   try {
     await api('/api/health');
     setStatus('Connected');
@@ -5775,6 +5781,8 @@ async function loadMatrixFromPortmap() {
     if (hint) hint.textContent = `A: ${hintA}  ↔  B: ${hintB}`;
     const st = $('matrixSt');
     if (st) { st.textContent = `${_mx.nodeAIfaces.length}×${_mx.nodeBIfaces.length} = ${total}조합`; st.className = 'reg-status ok'; setTimeout(() => { st.textContent = ''; }, 3000); }
+    const comboLabel = $('matrixComboLabel');
+    if (comboLabel) comboLabel.textContent = `${_mx.nodeAIfaces.length} × ${_mx.nodeBIfaces.length} 전체 조합 (A국 ${_mx.nodeAIfaces.length} · B국 ${_mx.nodeBIfaces.length})`;
   } catch (e) { toast(`Portmap load: ${e.message}`, 'bad'); }
 }
 
@@ -6598,6 +6606,211 @@ function exportMatrixBenchReport() {
   a.href     = url;
   a.download = `matrix_benchmark_${new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')}.html`;
   a.click(); URL.revokeObjectURL(url);
+}
+
+// ── 10G line-rate test (pktgen) ─────────────────────────────────────────────
+let _pgtgAbort   = false;
+let _pgtgRunning = false;
+
+async function initPktgenPanel() {
+  // Availability badge
+  const av = $('pgtgAvail');
+  try {
+    const r = await api('/api/pktgen/available');
+    if (av) {
+      av.textContent = r.available ? 'pktgen ready' : 'pktgen 없음 (modprobe 필요)';
+      av.className   = 'reg-status ' + (r.available ? 'ok' : 'bad');
+    }
+  } catch { if (av) { av.textContent = '상태 확인 실패'; av.className = 'reg-status bad'; } }
+
+  // Populate interface select (local NICs). Prefer 10G enp* with an IPv4.
+  const sel = $('pgtgIface');
+  if (sel) {
+    let ifaces = state.interfaces;
+    if (!ifaces?.length) { try { ifaces = (await api('/api/interfaces')).interfaces || []; state.interfaces = ifaces; } catch { ifaces = []; } }
+    const usable = (ifaces || []).filter(i => i.name && i.name !== 'lo');
+    const cur = sel.value;
+    sel.innerHTML = usable.map(i => {
+      const ip = i.ipv4?.[0]?.local ? ` (${i.ipv4[0].local})` : '';
+      return `<option value="${i.name}">${i.name}${ip}</option>`;
+    }).join('') || '<option value="">— 인터페이스 없음 —</option>';
+    // default: the configured 10G port if present (192.168.1.111 / enp12s0f1)
+    const pref = usable.find(i => (i.ipv4?.[0]?.local || '').startsWith('192.168.1.')) || usable.find(i => /^enp/.test(i.name));
+    sel.value = cur || pref?.name || (usable[0]?.name || '');
+  }
+}
+
+function _pgtgModeChange() {
+  const mode = $('pgtgMode')?.value || 'count';
+  $('pgtgCountField').style.display = mode === 'count'    ? '' : 'none';
+  $('pgtgDurField').style.display   = mode === 'duration' ? '' : 'none';
+}
+
+async function _pgtgReadCounters() {
+  try {
+    const r = await api('/api/counter/read?port=all');
+    return r.counters || [];
+  } catch (e) { return { error: e.message }; }
+}
+
+function _pgtgStatCard(label, val, unit, cls = '') {
+  return `<div class="bench-stat ${cls}"><div class="bs-label">${label}</div><div class="bs-val">${val}</div><div class="bs-unit">${unit}</div></div>`;
+}
+
+function _renderPgtgTx(st) {
+  const wrap = $('pgtgTxCards');
+  if (!wrap) return;
+  const t = st.totals || {};
+  const gbps = (t.gbps ?? (t.bps ? t.bps / 1e9 : 0));
+  const mpps = (t.pps || 0) / 1e6;
+  wrap.innerHTML =
+    _pgtgStatCard('Throughput', gbps ? gbps.toFixed(2) : '—', 'Gbps', gbps >= 9 ? 'ok' : '') +
+    _pgtgStatCard('Packet Rate', mpps ? mpps.toFixed(3) : '—', 'Mpps') +
+    _pgtgStatCard('Packets Sent', (t.pktsSoFar || 0).toLocaleString(), 'frames') +
+    _pgtgStatCard('Errors', (t.errors || 0).toLocaleString(), '', (t.errors > 0 ? 'bad' : '')) +
+    _pgtgStatCard('Elapsed', ((st.elapsedMs || 0) / 1000).toFixed(1), 's');
+}
+
+function _renderPgtgCounters(before, after, elapsedMs) {
+  const cw = $('pgtgCntWrap');
+  const cards = $('pgtgCntCards');
+  const tbl = $('pgtgCntTableWrap');
+  if (!cw) return;
+  cw.style.display = '';
+
+  if (before?.error || after?.error || !Array.isArray(before) || !Array.isArray(after)) {
+    const msg = before?.error || after?.error || '카운터 형식 오류';
+    if (cards) cards.innerHTML = _pgtgStatCard('HW 카운터', 'N/A', '', 'bad');
+    if (tbl)   tbl.innerHTML = `<div style="font-size:11px;color:var(--muted);">시리얼 미연결 또는 측정 불가: ${msg}<br>스위치 시리얼 콘솔 연결 후 다시 실행하세요.</div>`;
+    return;
+  }
+
+  // diff by counter name
+  const beforeMap = new Map(before.map(c => [c.name, c.valueDec || 0]));
+  const rows = [];
+  let byteDelta = 0, frameDelta = 0;
+  for (const c of after) {
+    const b = beforeMap.get(c.name) ?? 0;
+    const d = (c.valueDec || 0) - b;
+    if (d !== 0) rows.push({ name: c.name, group: c.group, before: b, after: c.valueDec || 0, delta: d });
+    if (/byte|oct/i.test(c.name)) byteDelta += d;
+    if (/frame|pkt|packet/i.test(c.name) && !/byte|oct/i.test(c.name)) frameDelta += d;
+  }
+  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+  const secs = (elapsedMs || 1) / 1000;
+  const fwdGbps = byteDelta > 0 ? (byteDelta * 8 / 1e9 / secs) : 0;
+  if (cards) {
+    cards.innerHTML =
+      _pgtgStatCard('Forwarded', fwdGbps ? fwdGbps.toFixed(2) : '—', 'Gbps', fwdGbps >= 9 ? 'ok' : '') +
+      _pgtgStatCard('Δ Bytes', byteDelta ? byteDelta.toLocaleString() : '—', 'bytes') +
+      _pgtgStatCard('Δ Frames', frameDelta ? frameDelta.toLocaleString() : '—', 'frames') +
+      _pgtgStatCard('변화 카운터', rows.length, '개');
+  }
+  if (tbl) {
+    if (!rows.length) { tbl.innerHTML = '<div style="font-size:11px;color:var(--muted);">변화된 카운터 없음 (포워딩 측정 실패 또는 카운터 0).</div>'; return; }
+    tbl.innerHTML =
+      '<table class="matrix-grid" style="font-size:10px;"><thead><tr>' +
+      '<th style="text-align:left;">Counter</th><th>Group</th><th style="text-align:right;">Before</th><th style="text-align:right;">After</th><th style="text-align:right;">Δ</th>' +
+      '</tr></thead><tbody>' +
+      rows.slice(0, 40).map(r =>
+        `<tr><td style="text-align:left;" class="mono">${r.name}</td><td>${r.group || ''}</td>` +
+        `<td style="text-align:right;">${r.before.toLocaleString()}</td><td style="text-align:right;">${r.after.toLocaleString()}</td>` +
+        `<td style="text-align:right;font-weight:700;color:var(--accent);">${r.delta > 0 ? '+' : ''}${r.delta.toLocaleString()}</td></tr>`
+      ).join('') +
+      '</tbody></table>' +
+      (rows.length > 40 ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;">…외 ${rows.length - 40}개</div>` : '');
+  }
+}
+
+async function runPktgenTest() {
+  if (_pgtgRunning) return;
+  const iface = $('pgtgIface')?.value;
+  if (!iface) return toast('인터페이스를 선택하세요', 'bad');
+  const mode      = $('pgtgMode')?.value || 'count';
+  const pktSize   = Math.max(60, parseInt($('pgtgPktSize')?.value) || 1500);
+  const threads   = Math.max(1, parseInt($('pgtgThreads')?.value) || 1);
+  const cloneSkb  = Math.max(0, parseInt($('pgtgClone')?.value) || 0);
+  const dstMac    = $('pgtgDstMac')?.value?.trim() || 'ff:ff:ff:ff:ff:ff';
+  const dstIp     = $('pgtgDstIp')?.value?.trim() || '10.0.0.1';
+  const count     = Math.max(1000, parseInt($('pgtgCount')?.value) || 2000000);
+  const durationS = Math.max(1, parseInt($('pgtgDuration')?.value) || 10);
+  const useCnt    = $('pgtgUseCounters')?.checked;
+
+  const opts = { iface, pktSize, threads, cloneSkb, dstMac, dstIp, count: mode === 'count' ? count : 0 };
+
+  _pgtgAbort = false; _pgtgRunning = true;
+  $('pgtgRun').style.display = 'none';
+  $('pgtgStop').style.display = '';
+  $('pgtgResultsWrap').style.display = '';
+  $('pgtgProgressWrap').style.display = '';
+  const phase = $('pgtgPhase');
+
+  // 1) Snapshot switch HW counters before
+  let cntBefore = null;
+  if (useCnt) { if (phase) phase.textContent = '카운터 스냅샷(before)…'; cntBefore = await _pgtgReadCounters(); }
+
+  // 2) Start pktgen
+  if (phase) phase.textContent = '트래픽 생성 중…';
+  const t0 = Date.now();
+  try {
+    await api('/api/pktgen/start', { method: 'POST', body: JSON.stringify(opts) });
+  } catch (e) {
+    toast(`pktgen 시작 실패: ${e.message}`, 'bad');
+    return _pgtgFinish();
+  }
+
+  // duration mode: auto-stop
+  let durTimer = null;
+  if (mode === 'duration') durTimer = setTimeout(() => { stopPktgenTest(); }, durationS * 1000);
+
+  // 3) Poll status
+  let last = null;
+  while (!_pgtgAbort) {
+    await new Promise(r => setTimeout(r, 500));
+    try { last = await api('/api/pktgen/status'); } catch { continue; }
+    _renderPgtgTx(last);
+    // progress
+    const fill = $('pgtgProgressFill'), pct = $('pgtgProgressPct'), lbl = $('pgtgProgressLabel');
+    if (mode === 'count') {
+      const p = Math.min(100, (last.totals?.pktsSoFar || 0) / count * 100);
+      if (fill) fill.style.width = p + '%'; if (pct) pct.textContent = p.toFixed(0) + '%';
+      if (lbl) lbl.textContent = `${(last.totals?.pktsSoFar || 0).toLocaleString()} / ${count.toLocaleString()} frames`;
+    } else if (mode === 'duration') {
+      const p = Math.min(100, (Date.now() - t0) / (durationS * 1000) * 100);
+      if (fill) fill.style.width = p + '%'; if (pct) pct.textContent = p.toFixed(0) + '%';
+      if (lbl) lbl.textContent = `${((Date.now() - t0) / 1000).toFixed(1)}s / ${durationS}s`;
+    } else {
+      if (fill) fill.style.width = '100%'; if (pct) pct.textContent = '연속';
+      if (lbl) lbl.textContent = `${(last.totals?.pktsSoFar || 0).toLocaleString()} frames (연속)`;
+    }
+    if (last.done) break;
+  }
+  if (durTimer) clearTimeout(durTimer);
+
+  // 4) Final status + counters after
+  try { last = await api('/api/pktgen/status'); _renderPgtgTx(last); } catch {}
+  const elapsedMs = last?.elapsedMs || (Date.now() - t0);
+  if (useCnt) {
+    if (phase) phase.textContent = '카운터 스냅샷(after)…';
+    const cntAfter = await _pgtgReadCounters();
+    _renderPgtgCounters(cntBefore, cntAfter, elapsedMs);
+  }
+  if (phase) phase.textContent = '완료';
+  toast(`10G 테스트 완료 — ${(last?.totals?.gbps ?? 0).toFixed(2)} Gbps, ${(last?.totals?.pktsSoFar || 0).toLocaleString()} frames`, 'ok');
+  _pgtgFinish();
+}
+
+async function stopPktgenTest() {
+  _pgtgAbort = true;
+  try { await api('/api/pktgen/stop', { method: 'POST', body: '{}' }); } catch {}
+}
+
+function _pgtgFinish() {
+  _pgtgRunning = false;
+  if ($('pgtgRun'))  $('pgtgRun').style.display = '';
+  if ($('pgtgStop')) $('pgtgStop').style.display = 'none';
+  const fill = $('pgtgProgressFill'); if (fill) fill.style.width = '0%';
 }
 
 function _buildMatrixBenchReport(results) {

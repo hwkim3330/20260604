@@ -2065,7 +2065,7 @@
         <!-- ── 2-PC MATRIX TEST ──────────────────────────────────────────────── -->
         <div class="st-card" style="margin-top:16px;">
           <div class="st-card-head">
-            2-PC MATRIX TEST <small style="font-weight:400;color:var(--muted);">4 × 2 전체 조합</small>
+            2-PC MATRIX TEST <small id="matrixComboLabel" style="font-weight:400;color:var(--muted);">전체 조합 (포트맵 로드)</small>
             <div style="display:flex;gap:6px;align-items:center;">
               <span id="matrixSt" class="reg-status"></span>
               <button class="small" id="matrixLoadPorts">↻ 포트맵 로드</button>
@@ -2293,6 +2293,105 @@
           </div>
         </div>
 
+        <!-- ── 10G LINE-RATE TEST (pktgen) ──────────────────────────────────── -->
+        <div class="st-card" style="margin-top:16px;" id="pgtgCard">
+          <div class="st-card-head">
+            10G LINE-RATE TEST
+            <small style="font-weight:400;color:var(--muted);">커널 pktgen — 실제 회선속도 부하</small>
+            <div class="ph-actions">
+              <span id="pgtgAvail" class="reg-status"></span>
+            </div>
+          </div>
+          <div class="st-card-body">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:10px;">
+              JS 패킷 전송(cap)은 수만 pps가 한계라 10G를 못 채웁니다. 이 테스트는 커널 <b>pktgen</b>으로
+              NIC에서 직접 라인레이트 트래픽을 생성하고, 스위치 HW 카운터로 포워딩량을 측정합니다.
+              <b>실제 트래픽이 DUT로 송출됩니다.</b>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
+              <div class="field">
+                <label>Interface (이 PC · 10G)</label>
+                <select id="pgtgIface"><option value="">— 로드 중 —</option></select>
+              </div>
+              <div class="field">
+                <label>Frame Size (bytes)</label>
+                <input id="pgtgPktSize" type="number" value="1500" min="60" max="9000">
+              </div>
+              <div class="field">
+                <label>Run Mode</label>
+                <select id="pgtgMode">
+                  <option value="count">Count (개수)</option>
+                  <option value="duration">Duration (초)</option>
+                  <option value="continuous">Continuous (수동 정지)</option>
+                </select>
+              </div>
+              <div class="field" id="pgtgCountField">
+                <label>Packet Count</label>
+                <input id="pgtgCount" type="number" value="2000000" min="1000">
+              </div>
+              <div class="field" id="pgtgDurField" style="display:none;">
+                <label>Duration (s)</label>
+                <input id="pgtgDuration" type="number" value="10" min="1" max="600">
+              </div>
+              <div class="field">
+                <label>Threads (TX CPU)</label>
+                <input id="pgtgThreads" type="number" value="1" min="1" max="16">
+              </div>
+              <div class="field">
+                <label>Clone SKB</label>
+                <input id="pgtgClone" type="number" value="1000" min="0" title="0=매 패킷 새 빌드(느림), >0=재사용(빠름)">
+              </div>
+              <div class="field">
+                <label>Dst MAC</label>
+                <input id="pgtgDstMac" type="text" value="ff:ff:ff:ff:ff:ff">
+              </div>
+              <div class="field">
+                <label>Dst IP</label>
+                <input id="pgtgDstIp" type="text" value="192.168.1.200">
+              </div>
+            </div>
+
+            <label class="bench-check-label" style="margin:8px 0;">
+              <input type="checkbox" id="pgtgUseCounters" checked>
+              스위치 HW 카운터로 포워딩 측정 (serial read_cnt · before/after diff)
+            </label>
+
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+              <button class="primary" id="pgtgRun">&#9654; Run 10G Test</button>
+              <button class="danger small" id="pgtgStop" style="display:none;">&#9632; Stop</button>
+              <span id="pgtgPhase" style="font-size:11px;color:var(--muted);margin-left:8px;"></span>
+            </div>
+
+            <!-- live progress -->
+            <div id="pgtgProgressWrap" style="display:none;margin-top:10px;">
+              <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-bottom:3px;">
+                <span id="pgtgProgressLabel">생성 중…</span>
+                <span id="pgtgProgressPct"></span>
+              </div>
+              <div style="height:5px;background:var(--border);border-radius:2px;overflow:hidden;">
+                <div id="pgtgProgressFill" style="height:100%;width:0%;background:#22c55e;transition:width .3s;"></div>
+              </div>
+            </div>
+
+            <!-- results -->
+            <div id="pgtgResultsWrap" style="display:none;margin-top:14px;">
+              <div style="font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.05em;margin-bottom:6px;">
+                TX — 생성기 (pktgen, 이 PC)
+              </div>
+              <div id="pgtgTxCards" class="bench-stat-grid"></div>
+
+              <div id="pgtgCntWrap" style="display:none;margin-top:12px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.05em;margin-bottom:6px;">
+                  RX — 스위치 HW 카운터 (포워딩 측정)
+                </div>
+                <div id="pgtgCntCards" class="bench-stat-grid"></div>
+                <div id="pgtgCntTableWrap" style="margin-top:8px;overflow-x:auto;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
     </section>
 
   </div><!-- .content -->
@@ -2303,6 +2402,6 @@
 <!-- TC floating dropdown (appended to body so it is above all panels) -->
 <div id="pgTcDropdown" class="pg-tc-dropdown" style="display:none;"></div>
 
-<script type="module" src="/app.js?v=20260529m"></script>
+<script type="module" src="/app.js?v=20260604a"></script>
 </body>
 </html>
