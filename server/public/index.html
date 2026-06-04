@@ -93,8 +93,10 @@
               <span id="pgSpinner" class="spinner" style="display:none;"></span>
               <label class="check-inline"><input id="pgRepeat" type="checkbox"> Repeat</label>
               <label class="check-inline"><input id="pgParallel" type="checkbox"> Parallel</label>
+              <span class="muted-label">전송 개수:</span>
+              <input id="pgCount" type="number" min="1" value="1" style="width:65px;" title="각 패킷을 백엔드에서 N번 연속 전송 (count)">
               <span class="muted-label">주기(ms):</span>
-              <input id="pgPeriod" type="number" min="0" value="0" style="width:65px;" title="패킷 간 전송 간격 (ms)">
+              <input id="pgPeriod" type="number" min="0" value="0" style="width:65px;" title="패킷 간 전송 간격 (ms) — count>1일 때 버스트 내부 간격">
             </div>
           </div>
           <div class="table-area">

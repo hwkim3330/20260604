@@ -771,6 +771,8 @@ function buildPacketPayload(pkt) {
   const blocks   = pkt?.blocks || [];
   const iface    = pkt.interface || '';
   const periodMs = parseInt($('pgPeriod')?.value) || 0;
+  // 전송 개수: 백엔드가 한 번의 요청으로 count번 연속 전송 (intervalMs = 버스트 내부 간격)
+  const sendCount = Math.max(1, parseInt($('pgCount')?.value) || 1);
   const eth      = blocks.find(b => b.type === 'Ethernet') || {};
   const ipv4B    = blocks.find(b => b.type === 'IPv4');
   const tcpB     = blocks.find(b => b.type === 'TCP');
@@ -807,7 +809,7 @@ function buildPacketPayload(pkt) {
       tos:     ipv4B?.tos  != null ? Number(ipv4B.tos)  : 0,
       ipProto: ipv4Proto,
     },
-    count: 1, intervalMs: periodMs,
+    count: sendCount, intervalMs: periodMs,
     payload: { mode: plB.mode || 'text', data: plB.data || '' },
   };
   if (udpB)  p.udp  = { srcPort: Number(udpB.srcPort) || 12345, dstPort: Number(udpB.dstPort) || 50000 };
@@ -1074,8 +1076,8 @@ async function sendSelectedPackets() {
       if (!pkt.interface) { pkt.status = 'ERR'; toast(`Packet "${pkt.name}": 인터페이스 미설정`, 'bad'); renderPacketList(); continue; }
       try {
         pkt.status = 'Running'; renderPacketList();
-        await api(_pktSendUrl(pkt.interface), { method:'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
-        pkt.status = 'Sent'; totalSent++;
+        const r = await api(_pktSendUrl(pkt.interface), { method:'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
+        pkt.status = 'Sent'; totalSent += (r?.framesSent || r?.stdout?.framesSent || 1);
       } catch (err) { pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad'); }
       totalAttempts++;
       renderPacketList();
@@ -1087,8 +1089,8 @@ async function sendSelectedPackets() {
   _pgSelRunning = false; _pgAbort = false;
   if (selBtn) { selBtn.textContent = '▶ Send Selected'; selBtn.style.cssText = ''; }
   if (pgSpinner) pgSpinner.style.display = 'none';
-  if (selStats) selStats.textContent = `시작: ${t0sel.toLocaleTimeString()} | 종료: ${new Date().toLocaleTimeString()} | 주기: ${cycle} | 전송: ${totalSent}/${totalAttempts}개`;
-  toast(`Send Selected: ${totalSent}/${totalAttempts} 완료`, totalSent === totalAttempts ? 'ok' : 'warn');
+  if (selStats) selStats.textContent = `시작: ${t0sel.toLocaleTimeString()} | 종료: ${new Date().toLocaleTimeString()} | 주기: ${cycle} | 전송: ${totalSent} 프레임 (${totalAttempts}개 패킷)`;
+  toast(`Send Selected: ${totalSent} 프레임 전송 완료`, 'ok');
 }
 
 async function sendPacketList() {
@@ -1133,8 +1135,8 @@ async function sendPacketList() {
           for (const pkt of group) {
             if (_pgAbort) break;
             try {
-              await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
-              pkt.status = 'Sent'; sent++;
+              const r = await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
+              pkt.status = 'Sent'; sent += (r?.framesSent || r?.stdout?.framesSent || 1);
             } catch (err) {
               pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad');
             }
@@ -1155,8 +1157,8 @@ async function sendPacketList() {
         if (!pkt.interface) { pkt.status = 'ERR'; toast(`Packet "${pkt.name}": 인터페이스 미설정`, 'bad'); renderPacketList(); continue; }
         try {
           pkt.status = 'Running'; renderPacketList();
-          await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
-          pkt.status = 'Sent'; totalSent++;
+          const r = await api(_pktSendUrl(pkt.interface), { method: 'POST', body: JSON.stringify(buildPacketPayload(pkt)) });
+          pkt.status = 'Sent'; totalSent += (r?.framesSent || r?.stdout?.framesSent || 1);
         } catch (err) { pkt.status = 'ERR'; toast(`Send failed: ${err.message}`, 'bad'); }
         totalAttempts++;
         renderPacketList();
@@ -1170,8 +1172,8 @@ async function sendPacketList() {
   _pgListRunning = false; _pgAbort = false;
   if (listBtn) { listBtn.textContent = '▶▶ Send List'; listBtn.style.cssText = ''; }
   if (pgSpinnerL) pgSpinnerL.style.display = 'none';
-  if (listStats) listStats.textContent = `시작: ${t0list.toLocaleTimeString()} | 종료: ${new Date().toLocaleTimeString()} | 주기: ${cycle} | 전송: ${totalSent}/${totalAttempts}개`;
-  toast(`Send List: ${totalSent}/${totalAttempts} 완료`, 'ok');
+  if (listStats) listStats.textContent = `시작: ${t0list.toLocaleTimeString()} | 종료: ${new Date().toLocaleTimeString()} | 주기: ${cycle} | 전송: ${totalSent} 프레임 (${totalAttempts}개 패킷)`;
+  toast(`Send List: ${totalSent} 프레임 전송 완료`, 'ok');
 }
 
 // ── TC Import (Packet Generator) ─────────────────────────────────────────────
