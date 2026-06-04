@@ -5313,6 +5313,9 @@ async function init() {
   $('portmapReload')?.addEventListener('click', loadPortMap);
   $('portmapSave')?.addEventListener('click', savePortMap);
   $('portmapProbeB')?.addEventListener('click', probePortMapB);
+  // Node B URL은 단일 입력(여기) — 2-PC/Benchmark 표시는 자동 연동
+  $('portmapNodeBUrl')?.addEventListener('input', (e) => { e.target._userEdited = true; _syncNodeUrlViews(); });
+  _loadPortmapSilent().then(_syncNodeUrlViews);
 
   // 2-PC Experiment
   $('twoPcProbeA')?.addEventListener('click', () => twoPcProbe('A'));
@@ -5553,6 +5556,7 @@ async function loadPortMap() {
       $(`pmNode${p}`)?.addEventListener('change', () => _setPortMapRowNode(p));
       _updatePortMapRow(p);
     }
+    _syncNodeUrlViews();
     // Auto-probe Node B silently so MAC/IP appear without manual click
     if (remoteEntry?.nodeUrl) _probePortMapBSilent(remoteEntry.nodeUrl);
   } catch (e) {
@@ -5671,13 +5675,28 @@ async function savePortMap() {
   }
 }
 
+// ── Node URL single source ────────────────────────────────────────────────────
+// Node A is always this server (no manual entry); Node B comes from the one
+// Node B URL field in Port Mapping — every other section just mirrors it.
+function _nodeAUrl() { return window.location.origin; }
+function _nodeBUrlShared() {
+  return $('portmapNodeBUrl')?.value?.trim()
+      || state.portmap.find(e => e.nodeUrl)?.nodeUrl
+      || '';
+}
+function _syncNodeUrlViews() {
+  const a = _nodeAUrl();
+  const b = _nodeBUrlShared() || '— Port Mapping에서 Node B URL 설정 —';
+  ['twoPcUrlAView', 'benchUrlAView'].forEach(id => { const el = $(id); if (el) el.textContent = a; });
+  ['twoPcUrlBView', 'benchUrlBView'].forEach(id => { const el = $(id); if (el) el.textContent = b; });
+}
+
 // ── 2-PC Experiment ───────────────────────────────────────────────────────────
 async function twoPcProbe(side) {
-  const urlEl   = $(`twoPcUrl${side}`);
   const ifaceEl = $(`twoPcIface${side}`);
-  if (!urlEl || !ifaceEl) return;
-  const url = urlEl.value.trim();
-  if (!url) return toast(`Node ${side} URL is empty`, 'bad');
+  if (!ifaceEl) return;
+  const url = side === 'A' ? _nodeAUrl() : _nodeBUrlShared();
+  if (!url) return toast('Node B URL이 비어 있습니다 — Port Mapping에서 설정하세요', 'bad');
   try {
     const resp = await fetch(`${url}/api/interfaces`, { signal: AbortSignal.timeout(5000) });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -5700,8 +5719,8 @@ async function twoPcProbe(side) {
 }
 
 async function run2pcTest() {
-  const nodeAUrl  = $('twoPcUrlA')?.value?.trim();
-  const nodeBUrl  = $('twoPcUrlB')?.value?.trim();
+  const nodeAUrl  = _nodeAUrl();
+  const nodeBUrl  = _nodeBUrlShared();
   const nodeAIface = $('twoPcIfaceA')?.value;
   const nodeBIface = $('twoPcIfaceB')?.value;
   const direction  = $('twoPcDir')?.value || 'BOTH';
@@ -5775,8 +5794,8 @@ async function loadMatrixFromPortmap() {
     _renderMxIfaceList('A', _mx.nodeAIfaces);
     _renderMxIfaceList('B', _mx.nodeBIfaces);
     const total = _mx.nodeAIfaces.length * _mx.nodeBIfaces.length;
-    const hintA = $('twoPcUrlA')?.value || '';
-    const hintB = $('twoPcUrlB')?.value || '';
+    const hintA = _nodeAUrl();
+    const hintB = _nodeBUrlShared();
     const hint = $('matrixUrlHint');
     if (hint) hint.textContent = `A: ${hintA}  ↔  B: ${hintB}`;
     const st = $('matrixSt');
@@ -5871,8 +5890,8 @@ function _setMxDetailRow(i, a, b, atob, btoa, overall, err) {
 }
 
 async function runMatrixTest() {
-  const nodeAUrl = $('twoPcUrlA')?.value?.trim() || 'http://169.254.88.222:8080';
-  const nodeBUrl = $('twoPcUrlB')?.value?.trim() || 'http://169.254.1.168:8080';
+  const nodeAUrl = _nodeAUrl();
+  const nodeBUrl = _nodeBUrlShared();
   const direction = $('matrixDir')?.value || 'BOTH';
   const count = Number($('matrixCount')?.value || 10);
   const intervalMs = Number($('matrixInterval')?.value || 100);
@@ -6186,9 +6205,7 @@ function _benchProgress(pct, label) {
 
 async function benchLoadPorts() {
   await _loadPortmapSilent();
-  const urlEl = $('benchUrlA'); if (urlEl) urlEl.value = window.location.origin;
-  const bUrl  = state.portmap.find(e => e.nodeUrl)?.nodeUrl || '';
-  const bEl   = $('benchUrlB'); if (bEl && bUrl) bEl.value = bUrl;
+  _syncNodeUrlViews();
 
   // A interfaces
   const selA  = $('benchIfaceA');
@@ -6211,8 +6228,8 @@ async function benchLoadPorts() {
 }
 
 async function runBenchmark() {
-  const nodeAUrl  = ($('benchUrlA')?.value || '').trim() || window.location.origin;
-  const nodeBUrl  = ($('benchUrlB')?.value || '').trim();
+  const nodeAUrl  = _nodeAUrl();
+  const nodeBUrl  = _nodeBUrlShared();
   const nodeAIface = $('benchIfaceA')?.value || '';
   const nodeBIface = $('benchIfaceB')?.value || '';
   if (!nodeBUrl || !nodeAIface || !nodeBIface) {
@@ -6431,8 +6448,8 @@ function _benchMxProgress(pct, label) {
 }
 
 async function runMatrixBenchmark() {
-  const nodeAUrl = ($('benchUrlA')?.value || '').trim() || window.location.origin;
-  const nodeBUrl = ($('benchUrlB')?.value || '').trim();
+  const nodeAUrl = _nodeAUrl();
+  const nodeBUrl = _nodeBUrlShared();
 
   // Load pairs from portmap
   await _loadPortmapSilent();

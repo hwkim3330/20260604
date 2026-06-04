@@ -1980,11 +1980,11 @@
             <!-- Node A / Node B -->
             <div class="twopc-nodes">
               <div class="twopc-node">
-                <div class="twopc-node-title">NODE A <span style="font-weight:400;color:var(--muted);">(이 PC)</span></div>
+                <div class="twopc-node-title">NODE A <span style="font-weight:400;color:var(--muted);">(이 PC · URL 자동)</span></div>
                 <div class="field" style="margin-bottom:6px;">
-                  <label>URL</label>
-                  <div style="display:flex;gap:4px;">
-                    <input id="twoPcUrlA" type="text" value="http://169.254.88.222:8080">
+                  <label>URL (자동)</label>
+                  <div style="display:flex;gap:4px;align-items:center;">
+                    <span id="twoPcUrlAView" class="mono" style="font-size:11px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;">—</span>
                     <button class="small" id="twoPcProbeA" style="white-space:nowrap;">Probe</button>
                   </div>
                 </div>
@@ -1995,16 +1995,16 @@
               </div>
 
               <div class="twopc-node">
-                <div class="twopc-node-title">NODE B <span style="font-weight:400;color:var(--muted);">(상대 PC · SW P4/P5)</span></div>
+                <div class="twopc-node-title">NODE B <span style="font-weight:400;color:var(--muted);">(상대 PC · URL은 Port Mapping 연동)</span></div>
                 <div class="field" style="margin-bottom:6px;">
-                  <label>URL</label>
-                  <div style="display:flex;gap:4px;">
-                    <input id="twoPcUrlB" type="text" value="http://169.254.1.168:8080">
+                  <label>URL (Port Mapping의 Node B URL)</label>
+                  <div style="display:flex;gap:4px;align-items:center;">
+                    <span id="twoPcUrlBView" class="mono" style="font-size:11px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;">—</span>
                     <button class="small" id="twoPcProbeB" style="white-space:nowrap;">Probe</button>
                   </div>
                 </div>
                 <div class="field">
-                  <label>Interface (SW P4 or P5)</label>
+                  <label>Interface (Node B SW 포트)</label>
                   <select id="twoPcIfaceB"><option value="">— probe first —</option></select>
                 </div>
               </div>
@@ -2076,7 +2076,7 @@
 
             <!-- URL hint -->
             <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">
-              사용 URL: <span id="matrixUrlHint" style="font-family:Consolas,monospace;">위 2-PC Experiment 섹션 참조</span>
+              사용 URL: <span id="matrixUrlHint" style="font-family:Consolas,monospace;">A: 이 PC (자동) ↔ B: Port Mapping의 Node B URL</span>
             </div>
 
             <!-- Interface selection -->
@@ -2179,10 +2179,10 @@
             <!-- Node A / B -->
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
               <div>
-                <div class="matrix-node-title">NODE A (이 PC)</div>
+                <div class="matrix-node-title">NODE A (이 PC · URL 자동)</div>
                 <div class="field" style="margin-bottom:5px;">
-                  <label>URL</label>
-                  <input id="benchUrlA" type="text" value="http://localhost:8080">
+                  <label>URL (자동)</label>
+                  <span id="benchUrlAView" class="mono" style="display:block;font-size:11px;color:var(--muted);padding:4px 0;">—</span>
                 </div>
                 <div class="field">
                   <label>Interface</label>
@@ -2190,10 +2190,10 @@
                 </div>
               </div>
               <div>
-                <div class="matrix-node-title">NODE B (상대 PC)</div>
+                <div class="matrix-node-title">NODE B (상대 PC · Port Mapping 연동)</div>
                 <div class="field" style="margin-bottom:5px;">
-                  <label>URL</label>
-                  <input id="benchUrlB" type="text" value="http://169.254.1.168:8080">
+                  <label>URL (Port Mapping의 Node B URL)</label>
+                  <span id="benchUrlBView" class="mono" style="display:block;font-size:11px;color:var(--muted);padding:4px 0;">—</span>
                 </div>
                 <div class="field">
                   <label>Interface</label>
@@ -2402,6 +2402,6 @@
 <!-- TC floating dropdown (appended to body so it is above all panels) -->
 <div id="pgTcDropdown" class="pg-tc-dropdown" style="display:none;"></div>
 
-<script type="module" src="/app.js?v=20260604a"></script>
+<script type="module" src="/app.js?v=20260604b"></script>
 </body>
 </html>
