@@ -5526,20 +5526,25 @@ async function loadPortMap() {
       const savedOpt = (isRemote && saved.iface && !ifacePool.find(i => i.name === saved.iface))
         ? `<option value="${saved.iface}" selected>${saved.iface}</option>` : '';
 
-      const nodeBadge = isRemote
-        ? `<span class="pm-badge pm-remote">Node B</span>`
-        : `<span class="pm-badge pm-local">Local</span>`;
+      // Node is per-row editable: any switch port may be wired to the local PC (Node A)
+      // or to the remote PC (Node B). Toggling re-populates the interface dropdown.
+      const nodeSel =
+        `<select id="pmNode${p}" class="small-select pm-node-sel">` +
+          `<option value="local"  ${isRemote ? '' : 'selected'}>Local</option>` +
+          `<option value="remote" ${isRemote ? 'selected' : ''}>Node B</option>` +
+        `</select>`;
 
       const tr = document.createElement('tr');
       tr.innerHTML =
         `<td style="text-align:center;font-weight:700;">P${p}</td>` +
-        `<td style="text-align:center;">${nodeBadge}</td>` +
+        `<td style="text-align:center;">${nodeSel}</td>` +
         `<td><select id="pmIface${p}" class="small-select" data-remote="${isRemote}" data-nodeurl="${saved.nodeUrl||''}">` +
           `<option value="">— none —</option>${savedOpt}${ifaceOpts}</select></td>` +
         `<td class="mono" id="pmMac${p}" style="font-size:10px;color:var(--muted);"></td>` +
         `<td class="mono" id="pmIp${p}"  style="font-size:10px;color:var(--muted);"></td>`;
       tbody.appendChild(tr);
       $(`pmIface${p}`)?.addEventListener('change', () => _updatePortMapRow(p));
+      $(`pmNode${p}`)?.addEventListener('change', () => _setPortMapRowNode(p));
       _updatePortMapRow(p);
     }
     // Auto-probe Node B silently so MAC/IP appear without manual click
@@ -5559,6 +5564,31 @@ function _updatePortMapRow(p) {
   const iface = pool.find(i => i.name === sel.value);
   if (macEl) macEl.textContent = iface?.mac || '';
   if (ipEl)  ipEl.textContent  = iface?.ipv4?.[0]?.local || '';
+}
+
+// Toggle a port row between Local (this PC) and Node B (remote PC). Repopulates the
+// interface dropdown from the matching pool and records the Node B URL on the row.
+function _setPortMapRowNode(p) {
+  const nodeSel = $(`pmNode${p}`);
+  const sel     = $(`pmIface${p}`);
+  if (!nodeSel || !sel) return;
+  const isRemote = nodeSel.value === 'remote';
+  const nodeBUrl = $('portmapNodeBUrl')?.value?.trim() || '';
+  sel.dataset.remote  = isRemote;
+  sel.dataset.nodeurl = isRemote ? nodeBUrl : '';
+
+  const pool    = isRemote ? state.portmapRemoteIfaces : state.interfaces;
+  const current = sel.value;
+  sel.innerHTML = `<option value="">— none —</option>` +
+    pool.map(i => {
+      const ip = i.ipv4?.[0]?.local ? ` (${i.ipv4[0].local})` : '';
+      return `<option value="${i.name}" ${i.name === current ? 'selected' : ''}>${i.name}${ip}</option>`;
+    }).join('');
+
+  if (isRemote && !state.portmapRemoteIfaces.length) {
+    toast('Node B 인터페이스 목록이 없습니다 — "Probe B"를 먼저 누르세요', 'warn');
+  }
+  _updatePortMapRow(p);
 }
 
 async function _probePortMapBSilent(url) {
@@ -5618,8 +5648,9 @@ async function savePortMap() {
   const nodeBUrl = $('portmapNodeBUrl')?.value?.trim() || '';
   const portmap = [];
   for (let p = 0; p < PM_PORTS; p++) {
-    const sel = $(`pmIface${p}`);
-    const isRemote = sel?.dataset.remote === 'true';
+    const sel      = $(`pmIface${p}`);
+    const nodeSel  = $(`pmNode${p}`);
+    const isRemote = nodeSel ? nodeSel.value === 'remote' : sel?.dataset.remote === 'true';
     const entry = { port: p, iface: sel?.value || '' };
     if (isRemote && nodeBUrl) entry.nodeUrl = nodeBUrl;
     portmap.push(entry);
