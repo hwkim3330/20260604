@@ -74,13 +74,19 @@ async function runTest(testName) {
 
       _state.statusText = `[${i + 1}/${steps.length}] ${step.name || step.eventType || step.type || 'step'}`;
 
-      // Look-ahead: if this packet step is followed by rxverify, pre-start capture NOW
-      // so the sent frame is already in the buffer when rxverify polls.
+      // Look-ahead: at the FIRST packet of a consecutive packet run, if the run is
+      // followed by rxverify, pre-start capture NOW so every frame of the run is
+      // already in the buffer when rxverify polls (not just the last one).
       const type = _getStepType(step);
-      if (['packet', 'sendpacket', 'send'].includes(type) && i + 1 < steps.length) {
-        const nextType = _getStepType(steps[i + 1]);
-        if (nextType === 'rxverify') {
-          const ns = steps[i + 1];
+      const isPacket = ['packet', 'sendpacket', 'send'].includes(type);
+      if (isPacket && capturePrestarted) {
+        nextCapturePrestarted = true; // 그룹 내 다음 스텝(다음 packet/rxverify)으로 플래그 전달
+      } else if (isPacket && !capturePrestarted) {
+        // 연속 packet run의 끝을 찾고 그 다음이 rxverify인지 확인
+        let after = i + 1;
+        while (after < steps.length && ['packet', 'sendpacket', 'send'].includes(_getStepType(steps[after]))) after++;
+        if (after < steps.length && _getStepType(steps[after]) === 'rxverify') {
+          const ns = steps[after];
           const portmap = _loadPortmap();
           const bitmap  = _parseBin(ns.Expected || ns.expected || '0');
           const nsIfaces = [];
@@ -94,7 +100,7 @@ async function runTest(testName) {
             _services.packetBackend.clearCapture();
             _services.packetBackend.startCapture(nsIfaces, '', () => {}, () => {});
             nextCapturePrestarted = true;
-            console.log(`[autoEngine] step ${i+1}: pre-started capture on [${nsIfaces.join(', ')}] for rxverify`);
+            console.log(`[autoEngine] step ${i+1}: pre-started capture on [${nsIfaces.join(', ')}] for rxverify (run of ${after - i} packet steps)`);
           }
         }
       }
