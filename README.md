@@ -73,9 +73,12 @@ sudo apt install -y git nodejs npm tcpdump libpcap-dev build-essential
 ## 설치 및 실행 (Quick Start)
 
 ```bash
+# 0. Node.js 22.x 필요 (두 PC 모두 동일 버전 — .nvmrc 참조)
+node -v   # v22.x 확인
+
 # 1. 클론
-git clone https://github.com/hwkim3330/20260528.git
-cd 20260528/server
+git clone https://github.com/hwkim3330/20260604.git
+cd 20260604/server
 
 # 2. 패키지 설치
 npm install
@@ -83,6 +86,8 @@ npm install
 # 3. 실행 (캡처·전송은 root 권한 필요)
 sudo node server.js
 ```
+
+> 두 노드의 코드·Node 버전 일치 여부는 `GET /api/health`의 `version` 필드(app/commit/node)로 확인할 수 있습니다.
 
 브라우저: `http://localhost:8080`
 

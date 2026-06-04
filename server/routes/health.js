@@ -3,10 +3,25 @@ const { Router } = require('express');
 const os = require('os');
 const router = Router();
 
+// Version info resolved once at startup — lets two nodes be compared at a glance
+// (노드 A/B 코드·Node.js 버전 일치 확인용)
+const VERSION = (() => {
+  let commit = null;
+  try {
+    commit = require('child_process')
+      .execSync('git rev-parse --short HEAD', { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+  } catch { /* not a git checkout (e.g. copied folder) */ }
+  let pkg = '0.0.0';
+  try { pkg = require('../package.json').version; } catch {}
+  return { app: pkg, commit, node: process.version };
+})();
+
 router.get('/health', (req, res) => {
   res.json({
     ok: true,
     server: { name: 'packet-lab-manager', port: Number(process.env.PORT || 8080) },
+    version: VERSION,
     time: new Date().toISOString()
   });
 });
