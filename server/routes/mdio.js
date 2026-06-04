@@ -45,63 +45,95 @@ async function regWrite(req, offset, value) {
   }, 5000);
 }
 
+// One MDIO transaction on a port's ACC register: write cmd, poll EN(bit31) clear.
+// Returns the final raw ACC value (read data in [15:0] for read transactions).
+async function mdioXact(req, acc, cmd, timeoutMs = 2000) {
+  await regWrite(req, acc, cmd);
+  const deadline = Date.now() + timeoutMs;
+  let raw = cmd; // seed with EN=1 so loop runs at least once
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 50));
+    raw = await regRead(req, acc);
+    if ((raw & 0x80000000) === 0) return raw;
+  }
+  throw new Error('MDIO transaction timeout');
+}
+
+function accCmd(write, phyAddr, regAddr, data = 0) {
+  return (0x80000000 | (write ? (1 << 26) : 0) |
+          ((phyAddr & 0x1F) << 21) | ((regAddr & 0x1F) << 16) | (data & 0xFFFF)) >>> 0;
+}
+
+// ── Clause 22 Annex 22D indirect MMD access ───────────────────────────────────
+// Direct access only covers PHY registers 0x00-0x1F (ACC reg field is 5 bits).
+// Registers beyond 0x1F live in MMD register space (e.g. MMD1F) and are reached
+// through Reg 0x0D (MMD Access Control) + Reg 0x0E (MMD Address/Data):
+//   1. Reg 0x0D ← fn=00(Address) | DEVAD      2. Reg 0x0E ← target reg addr
+//   3. Reg 0x0D ← fn=01(Data)    | DEVAD      4. Reg 0x0E → read / ← write data
+const MMD_CTRL = 0x0D;
+const MMD_DATA = 0x0E;
+const FN_DATA  = 0x4000; // function=01 (data, no post-increment)
+
+async function mmdSetAddr(req, acc, phyAddr, devad, regAddr) {
+  await mdioXact(req, acc, accCmd(true, phyAddr, MMD_CTRL, devad & 0x1F));           // fn=Address
+  await mdioXact(req, acc, accCmd(true, phyAddr, MMD_DATA, regAddr & 0xFFFF));       // target addr
+  await mdioXact(req, acc, accCmd(true, phyAddr, MMD_CTRL, FN_DATA | (devad & 0x1F))); // fn=Data
+}
+
+async function mmdRead(req, acc, phyAddr, devad, regAddr) {
+  await mmdSetAddr(req, acc, phyAddr, devad, regAddr);
+  const raw = await mdioXact(req, acc, accCmd(false, phyAddr, MMD_DATA));
+  return raw & 0xFFFF;
+}
+
+async function mmdWrite(req, acc, phyAddr, devad, regAddr, data) {
+  await mmdSetAddr(req, acc, phyAddr, devad, regAddr);
+  await mdioXact(req, acc, accCmd(true, phyAddr, MMD_DATA, data & 0xFFFF));
+}
+
 // ── POST /api/mdio/read ───────────────────────────────────────────────────────
-// body: { port, phyAddr, regAddr }
-// ACC_DATA bit31=EN, bit26=WR=0(read), [25:21]=PHY, [20:16]=REG
+// body: { port, phyAddr, regAddr, devad? }
+// regAddr 0x00-0x1F → direct ACC read.
+// regAddr > 0x1F (or devad given) → indirect MMD access (devad defaults to 0x1F).
 router.post('/mdio/read', async (req, res) => {
   try {
     const port    = Number(req.body.port ?? 0);
     const phyAddr = parseHex(req.body.phyAddr ?? '0x00');
     const regAddr = parseHex(req.body.regAddr ?? '0x01');
+    const devad   = req.body.devad != null ? parseHex(req.body.devad) : 0x1F;
+    const indirect = regAddr > 0x1F || req.body.devad != null;
 
     if (port < 0 || port > 5) throw new Error('port must be 0-5');
-
     const acc = blockBase(port) + OFF_ACC;
-    const cmd = 0x80000000 | ((phyAddr & 0x1F) << 21) | ((regAddr & 0x1F) << 16);
-    await regWrite(req, acc, cmd);
 
-    // Poll up to 2000ms, 50ms interval
-    const deadline = Date.now() + 2000;
-    let raw = cmd; // seed with EN=1 so loop runs at least once
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 50));
-      raw = await regRead(req, acc);
-      if ((raw & 0x80000000) === 0) break;
-    }
-    if ((raw & 0x80000000) !== 0) throw new Error('MDIO read timeout');
+    const value = indirect
+      ? await mmdRead(req, acc, phyAddr, devad, regAddr)
+      : (await mdioXact(req, acc, accCmd(false, phyAddr, regAddr))) & 0xFFFF;
 
-    const value = raw & 0xFFFF;
-    res.json({ ok: true, value: '0x' + value.toString(16).toUpperCase().padStart(4, '0'), raw: value });
+    res.json({ ok: true, value: '0x' + value.toString(16).toUpperCase().padStart(4, '0'), raw: value,
+               access: indirect ? 'mmd-indirect' : 'direct', devad: indirect ? devad : undefined });
   } catch (e) { wErr(res, e); }
 });
 
 // ── POST /api/mdio/write ──────────────────────────────────────────────────────
-// body: { port, phyAddr, regAddr, value }
-// ACC_DATA bit31=EN, bit26=WR=1(write), [25:21]=PHY, [20:16]=REG, [15:0]=DATA
+// body: { port, phyAddr, regAddr, value, devad? }
+// Same direct/indirect auto-branch as /mdio/read.
 router.post('/mdio/write', async (req, res) => {
   try {
     const port    = Number(req.body.port ?? 0);
     const phyAddr = parseHex(req.body.phyAddr ?? '0x00');
     const regAddr = parseHex(req.body.regAddr ?? '0x01');
     const data    = parseHex(req.body.value   ?? '0x0000') & 0xFFFF;
+    const devad   = req.body.devad != null ? parseHex(req.body.devad) : 0x1F;
+    const indirect = regAddr > 0x1F || req.body.devad != null;
 
     if (port < 0 || port > 5) throw new Error('port must be 0-5');
-
     const acc = blockBase(port) + OFF_ACC;
-    const cmd = 0x80000000 | (1 << 26) | ((phyAddr & 0x1F) << 21) | ((regAddr & 0x1F) << 16) | data;
-    await regWrite(req, acc, cmd);
 
-    // Poll for completion
-    const deadline = Date.now() + 2000;
-    let raw = cmd;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 50));
-      raw = await regRead(req, acc);
-      if ((raw & 0x80000000) === 0) break;
-    }
-    if ((raw & 0x80000000) !== 0) throw new Error('MDIO write timeout');
+    if (indirect) await mmdWrite(req, acc, phyAddr, devad, regAddr, data);
+    else          await mdioXact(req, acc, accCmd(true, phyAddr, regAddr, data));
 
-    res.json({ ok: true });
+    res.json({ ok: true, access: indirect ? 'mmd-indirect' : 'direct', devad: indirect ? devad : undefined });
   } catch (e) { wErr(res, e); }
 });
 

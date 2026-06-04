@@ -4793,17 +4793,39 @@ async function mdioApplySetup() {
   catch(err){setRegStatus('rv-st-mdio',`Error: ${err.message}`,false);}
 }
 
+// Reg > 0x1F는 직접 접근 불가(ACC reg 필드 5비트) → MMD indirect(0x0D/0x0E) 자동 사용
+function _mdioAccParams() {
+  const port    = parseInt($('rv-mdio-port')?.value || '0');
+  const phyAddr = $('rv-mdio-phy-addr')?.value || '0x00';
+  const regAddr = $('rv-mdio-reg-addr')?.value || '0x01';
+  const devad   = $('rv-mdio-devad')?.value || '0x1F';
+  const indirect = (parseInt(String(regAddr).replace(/^0x/i,''),16) || 0) > 0x1F;
+  const body = { port, phyAddr, regAddr };
+  if (indirect) body.devad = devad;
+  return { body, indirect, phyAddr, regAddr, devad };
+}
+
 async function mdioReadPhy() {
-  const port=parseInt($('rv-mdio-port')?.value||'0'),phyAddr=$('rv-mdio-phy-addr')?.value||'0x00',regAddr=$('rv-mdio-reg-addr')?.value||'0x01';
+  const { body, indirect, phyAddr, regAddr, devad } = _mdioAccParams();
   setRegStatus('rv-st-mdio-acc','Reading...',true);
-  try{const data=await api('/api/mdio/read',{method:'POST',body:JSON.stringify({port,phyAddr,regAddr})});if($('rv-mdio-acc-data'))$('rv-mdio-acc-data').value=data.value||'0x0000';setRegStatus('rv-st-mdio-acc',`PHY[${phyAddr}] Reg[${regAddr}] = ${data.value}`,true);}
+  try{
+    const data=await api('/api/mdio/read',{method:'POST',body:JSON.stringify(body)});
+    if($('rv-mdio-acc-data'))$('rv-mdio-acc-data').value=data.value||'0x0000';
+    const tag = indirect ? ` (MMD${devad} indirect)` : '';
+    setRegStatus('rv-st-mdio-acc',`PHY[${phyAddr}] Reg[${regAddr}]${tag} = ${data.value}`,true);
+  }
   catch(err){setRegStatus('rv-st-mdio-acc',`Error: ${err.message}`,false);}
 }
 
 async function mdioWritePhy() {
-  const port=parseInt($('rv-mdio-port')?.value||'0'),phyAddr=$('rv-mdio-phy-addr')?.value||'0x00',regAddr=$('rv-mdio-reg-addr')?.value||'0x01',value=$('rv-mdio-acc-data')?.value||'0x0000';
+  const { body, indirect, phyAddr, regAddr, devad } = _mdioAccParams();
+  body.value = $('rv-mdio-acc-data')?.value || '0x0000';
   setRegStatus('rv-st-mdio-acc','Writing...',true);
-  try{await api('/api/mdio/write',{method:'POST',body:JSON.stringify({port,phyAddr,regAddr,value})});setRegStatus('rv-st-mdio-acc',`PHY[${phyAddr}] Reg[${regAddr}] ← ${value} OK`,true);}
+  try{
+    await api('/api/mdio/write',{method:'POST',body:JSON.stringify(body)});
+    const tag = indirect ? ` (MMD${devad} indirect)` : '';
+    setRegStatus('rv-st-mdio-acc',`PHY[${phyAddr}] Reg[${regAddr}]${tag} ← ${body.value} OK`,true);
+  }
   catch(err){setRegStatus('rv-st-mdio-acc',`Error: ${err.message}`,false);}
 }
 

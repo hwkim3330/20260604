@@ -883,9 +883,10 @@
                     <div class="reg-status" id="rv-st-mdio"></div>
                   </div>
                   <div class="reg-card" id="rsec-mdio-acc">
-                    <div class="reg-card-title">PHY ACCESS</div>
+                    <div class="reg-card-title">PHY ACCESS <small style="font-weight:400;color:var(--muted);">Reg &gt; 0x1F → MMD indirect 자동</small></div>
                     <div class="field"><label>PHY Addr</label><input id="rv-mdio-phy-addr" class="mono" value="0x00" style="width:80px;"></div>
-                    <div class="field"><label>Reg Addr</label><input id="rv-mdio-reg-addr" class="mono" value="0x01" style="width:80px;"></div>
+                    <div class="field"><label>Reg Addr <small style="color:var(--muted);">(0x0000~0xFFFF)</small></label><input id="rv-mdio-reg-addr" class="mono" value="0x01" style="width:80px;"></div>
+                    <div class="field"><label>MMD DEVAD <small style="color:var(--muted);">(Reg&gt;0x1F 시 사용)</small></label><input id="rv-mdio-devad" class="mono" value="0x1F" style="width:80px;"></div>
                     <div class="field"><label>Data</label><input id="rv-mdio-acc-data" class="mono" value="0x0000"></div>
                     <div class="row">
                       <button class="small primary" id="rv-mdio-read-phy">Read PHY</button>
@@ -2402,6 +2403,6 @@
 <!-- TC floating dropdown (appended to body so it is above all panels) -->
 <div id="pgTcDropdown" class="pg-tc-dropdown" style="display:none;"></div>
 
-<script type="module" src="/app.js?v=20260604b"></script>
+<script type="module" src="/app.js?v=20260604c"></script>
 </body>
 </html>
