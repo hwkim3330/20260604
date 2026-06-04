@@ -1970,7 +1970,9 @@ function renderCaptureRows() {
   if (!tbody) return;
   const filter = ($('captureFilter')?.value || '').trim().toLowerCase();
   const activeIfaces = [...state.captureIfaceFilter].filter(k => !k.startsWith('__seen__'));
+  const showTx = $('captureShowTx')?.checked ?? false;  // 기본: TX 기록 숨김 (RX만)
   const rows = state.captureRows.filter(r => {
+    if (!showTx && r.direction === 'TX') return false;
     if (activeIfaces.length && r.interfaceName && !state.captureIfaceFilter.has(r.interfaceName)) return false;
     return rowMatchesFilter(r, filter);
   });
@@ -5299,6 +5301,7 @@ async function init() {
   $('captureStart')?.addEventListener('click', startCapture);
   $('captureStop')?.addEventListener('click', stopCapture);
   $('captureClear')?.addEventListener('click', clearCapture);
+  $('captureShowTx')?.addEventListener('change', renderCaptureRows);
   $('captureExportCsv')?.addEventListener('click', downloadCaptureCsv);
   $('captureFilter')?.addEventListener('input', () => {
     const val = ($('captureFilter')?.value || '').trim();
